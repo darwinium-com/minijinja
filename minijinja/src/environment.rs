@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+#[cfg(feature = "serialization")]
 use serde::Serialize;
 
 use crate::compiler::Compiler;
@@ -120,10 +121,15 @@ impl<'env> Template<'env> {
     /// can be any object that implements [`Serialize`](serde::Serialize).
     /// Typically custom structs annotated with `#[derive(Serialize)]` would
     /// be used for this purpose.
+    #[cfg(feature = "serialization")]
     pub fn render<S: Serialize>(&self, ctx: S) -> Result<String, Error> {
         // reduce total amount of code faling under mono morphization into
         // this function, and share the rest in _eval.
         self._render(Value::from_serializable(&ctx))
+    }
+
+    pub fn render_with_value(&self, root: Value) -> Result<String, Error> {
+        self._render(root)
     }
 
     fn _render(&self, root: Value) -> Result<String, Error> {
@@ -270,6 +276,7 @@ impl<'env, 'source> Expression<'env, 'source> {
     /// Evaluates the expression with some context.
     ///
     /// The result of the expression is returned as [`Value`].
+    #[cfg(feature = "serialization")]
     pub fn eval<S: Serialize>(&self, ctx: S) -> Result<Value, Error> {
         // reduce total amount of code faling under mono morphization into
         // this function, and share the rest in _eval.

@@ -115,34 +115,12 @@ impl<'de> Deserialize<'de> for Key<'static> {
 
 struct KeyVisitor;
 
-macro_rules! visit_key_primitive {
-    ($name:ident, $ty:ty, $enum_ty:ident) => {
-        fn $name<E>(self, v: $ty) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            Ok(Key::$enum_ty(v as _))
-        }
-    };
-}
-
 impl<'de> Visitor<'de> for KeyVisitor {
     type Value = Key<'static>;
 
     fn expecting(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
         fmt.write_str("any MiniJinja compatible value")
     }
-
-    visit_key_primitive!(visit_bool, bool, Bool);
-    visit_key_primitive!(visit_i8, i8, I64);
-    visit_key_primitive!(visit_i16, i16, I64);
-    visit_key_primitive!(visit_i32, i32, I64);
-    visit_key_primitive!(visit_i64, i64, I64);
-    visit_key_primitive!(visit_u8, u8, I64);
-    visit_key_primitive!(visit_u16, u16, I64);
-    visit_key_primitive!(visit_u32, u32, I64);
-    visit_key_primitive!(visit_u64, u64, I64);
-    visit_key_primitive!(visit_char, char, Char);
 
     fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
     where

@@ -74,10 +74,15 @@ use std::convert::TryFrom;
 use std::fmt::{self, Write};
 use std::sync::atomic::{self, AtomicBool, AtomicUsize};
 
+#[cfg(feature = "serialization")]
 use serde::ser::{self, Serialize, Serializer};
 
 use crate::error::{Error, ErrorKind};
-use crate::key::{Key, KeySerializer};
+#[cfg(feature = "serialization")]
+use crate::key::KeySerializer;
+
+use crate::key::Key;
+
 use crate::utils::{matches, OnDrop};
 use crate::vm::State;
 
@@ -390,10 +395,7 @@ impl From<u128> for Value {
 impl<'a> From<Key<'a>> for Value {
     fn from(val: Key) -> Self {
         match val {
-            Key::Bool(val) => val.into(),
-            Key::I64(val) => val.into(),
-            Key::Char(val) => val.into(),
-            Key::String(val) => ValueRepr::String(val).into(),
+            Key::String(val) => ValueRepr::String(RcType::new(val)).into(),
             Key::Str(val) => val.into(),
         }
     }
@@ -834,6 +836,7 @@ impl Value {
     /// During serialization of the value, [`serializing_for_value`] will return
     /// `true` which makes it possible to customize serialization for MiniJinja.
     /// For more information see [`serializing_for_value`].
+    #[cfg(feature = "serialization")]
     pub fn from_serializable<T: Serialize>(value: &T) -> Value {
         with_internal_serialization(|| Serialize::serialize(value, ValueSerializer).unwrap())
     }
@@ -1001,26 +1004,27 @@ impl Value {
     }
 
     fn get_item_opt(&self, key: &Value) -> Option<Value> {
-        let key = Key::from_borrowed_value(key).ok()?;
-
         match self.0 {
-            ValueRepr::Map(ref items) => return items.get(&key).cloned(),
+            ValueRepr::Map(ref items) => {
+                let key = Key::from_borrowed_value(key).ok()?;
+                return items.get(&key).cloned();
+            }
+
             ValueRepr::Seq(ref items) => {
-                if let Key::I64(idx) = key {
-                    let idx = isize::try_from(idx).ok()?;
-                    let idx = if idx < 0 {
-                        items.len() - (-idx as usize)
-                    } else {
-                        idx as usize
-                    };
+                if let Value(ValueRepr::I64(idx)) = key {
+                    let idx = isize::try_from(idx.clone()).ok()?;
+                    let idx = if idx < 0 { items.len() - (-idx as usize) } else { idx as usize };
                     return items.get(idx).cloned();
                 }
             }
-            ValueRepr::Dynamic(ref dy) => match key {
-                Key::String(ref key) => return dy.get_attr(key),
-                Key::Str(key) => return dy.get_attr(key),
-                _ => {}
-            },
+            ValueRepr::Dynamic(ref dy) => {
+                let key = Key::from_borrowed_value(key).ok()?;
+                match key {
+                    Key::String(ref key) => return dy.get_attr(key),
+                    Key::Str(key) => return dy.get_attr(key),
+                    _ => {}
+                }
+            }
             _ => {}
         }
         None
@@ -1057,19 +1061,7 @@ impl Value {
 
     pub(crate) fn try_into_key(self) -> Result<Key<'static>, Error> {
         match self.0 {
-            ValueRepr::Bool(val) => Ok(Key::Bool(val)),
-            ValueRepr::U64(v) => TryFrom::try_from(v)
-                .map(Key::I64)
-                .map_err(|_| ErrorKind::NonKey.into()),
-            ValueRepr::U128(ref v) => TryFrom::try_from(**v)
-                .map(Key::I64)
-                .map_err(|_| ErrorKind::NonKey.into()),
-            ValueRepr::I64(v) => Ok(Key::I64(v)),
-            ValueRepr::I128(ref v) => TryFrom::try_from(**v)
-                .map(Key::I64)
-                .map_err(|_| ErrorKind::NonKey.into()),
-            ValueRepr::Char(c) => Ok(Key::Char(c)),
-            ValueRepr::String(ref s) => Ok(Key::String(s.clone())),
+            ValueRepr::String(ref s) => Ok(Key::String(s.to_string())),
             _ => Err(ErrorKind::NonKey.into()),
         }
     }
@@ -1126,6 +1118,7 @@ impl Value {
     }
 }
 
+#[cfg(feature = "serialization")]
 impl Serialize for Value {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -1177,8 +1170,10 @@ impl Serialize for Value {
     }
 }
 
+#[cfg(feature = "serialization")]
 struct ValueSerializer;
 
+#[cfg(feature = "serialization")]
 impl Serializer for ValueSerializer {
     type Ok = Value;
     type Error = Error;
@@ -1376,10 +1371,12 @@ impl Serializer for ValueSerializer {
     }
 }
 
+#[cfg(feature = "serialization")]
 struct SerializeSeq {
     elements: Vec<Value>,
 }
 
+#[cfg(feature = "serialization")]
 impl ser::SerializeSeq for SerializeSeq {
     type Ok = Value;
     type Error = Error;
@@ -1398,10 +1395,12 @@ impl ser::SerializeSeq for SerializeSeq {
     }
 }
 
+#[cfg(feature = "serialization")]
 struct SerializeTuple {
     elements: Vec<Value>,
 }
 
+#[cfg(feature = "serialization")]
 impl ser::SerializeTuple for SerializeTuple {
     type Ok = Value;
     type Error = Error;
@@ -1420,10 +1419,12 @@ impl ser::SerializeTuple for SerializeTuple {
     }
 }
 
+#[cfg(feature = "serialization")]
 struct SerializeTupleStruct {
     fields: Vec<Value>,
 }
 
+#[cfg(feature = "serialization")]
 impl ser::SerializeTupleStruct for SerializeTupleStruct {
     type Ok = Value;
     type Error = Error;
@@ -1442,11 +1443,13 @@ impl ser::SerializeTupleStruct for SerializeTupleStruct {
     }
 }
 
+#[cfg(feature = "serialization")]
 struct SerializeTupleVariant {
     name: &'static str,
     fields: Vec<Value>,
 }
 
+#[cfg(feature = "serialization")]
 impl ser::SerializeTupleVariant for SerializeTupleVariant {
     type Ok = Value;
     type Error = Error;
@@ -1467,11 +1470,13 @@ impl ser::SerializeTupleVariant for SerializeTupleVariant {
     }
 }
 
+#[cfg(feature = "serialization")]
 struct SerializeMap {
     entries: ValueMap<Key<'static>, Value>,
     key: Option<Key<'static>>,
 }
 
+#[cfg(feature = "serialization")]
 impl ser::SerializeMap for SerializeMap {
     type Ok = Value;
     type Error = Error;
@@ -1514,11 +1519,13 @@ impl ser::SerializeMap for SerializeMap {
     }
 }
 
+#[cfg(feature = "serialization")]
 struct SerializeStruct {
     name: &'static str,
     fields: ValueMap<Key<'static>, Value>,
 }
 
+#[cfg(feature = "serialization")]
 impl ser::SerializeStruct for SerializeStruct {
     type Ok = Value;
     type Error = Error;
@@ -1551,11 +1558,13 @@ impl ser::SerializeStruct for SerializeStruct {
     }
 }
 
+#[cfg(feature = "serialization")]
 struct SerializeStructVariant {
     variant: &'static str,
     map: ValueMap<Key<'static>, Value>,
 }
 
+#[cfg(feature = "serialization")]
 impl ser::SerializeStructVariant for SerializeStructVariant {
     type Ok = Value;
     type Error = Error;
@@ -1715,6 +1724,7 @@ pub trait Object: fmt::Display + fmt::Debug + Any + Sync + Send {
 
 /// Utility macro to create a value from a literal
 #[cfg(test)]
+#[cfg(feature = "serialization")]
 macro_rules! value {
     ($value:expr) => {
         Value::from_serializable(&$value)
@@ -1722,6 +1732,7 @@ macro_rules! value {
 }
 
 #[test]
+#[cfg(feature = "serialization")]
 fn test_adding() {
     let err = add(&value!("a"), &value!(42)).unwrap_err();
     assert_eq!(
@@ -1770,6 +1781,7 @@ fn test_sort() {
 }
 
 #[test]
+#[cfg(feature = "serialization")]
 fn test_safe_string_roundtrip() {
     let v = Value::from_safe_string("<b>HTML</b>".into());
     let v2 = Value::from_serializable(&v);
@@ -1779,6 +1791,7 @@ fn test_safe_string_roundtrip() {
 }
 
 #[test]
+#[cfg(feature = "serialization")]
 fn test_undefined_roundtrip() {
     let v = Value::UNDEFINED;
     let v2 = Value::from_serializable(&v);
@@ -1823,23 +1836,9 @@ fn test_dynamic_object_roundtrip() {
 #[test]
 fn test_string_key_lookup() {
     let mut m = BTreeMap::new();
-    m.insert(Key::String(RcType::new("foo".into())), Value::from(42));
+    m.insert(Key::String("foo".into()), Value::from(42));
     let m = Value::from(m);
     assert_eq!(m.get_item(&Value::from("foo")).unwrap(), Value::from(42));
-}
-
-#[test]
-fn test_int_key_lookup() {
-    let mut m = BTreeMap::new();
-    m.insert(Key::I64(42), Value::from(42));
-    m.insert(Key::I64(23), Value::from(23));
-    let m = Value::from(m);
-    assert_eq!(m.get_item(&Value::from(42.0f32)).unwrap(), Value::from(42));
-    assert_eq!(m.get_item(&Value::from(42u32)).unwrap(), Value::from(42));
-
-    let s = Value::from(vec![42i32, 23]);
-    assert_eq!(s.get_item(&Value::from(0.0f32)).unwrap(), Value::from(42));
-    assert_eq!(s.get_item(&Value::from(0i32)).unwrap(), Value::from(42));
 }
 
 #[test]

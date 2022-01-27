@@ -56,4 +56,5 @@ float-abs: 42.5
 int-round: 42
 float-round: 43.0
 float-round-prec2: 42.51
+split: [Hello, Word]
 

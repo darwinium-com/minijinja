@@ -137,6 +137,7 @@ pub(crate) fn get_builtin_filters() -> BTreeMap<&'static str, BoxedFilter> {
         rv.insert("list", BoxedFilter::new(list));
         rv.insert("batch", BoxedFilter::new(batch));
         rv.insert("slice", BoxedFilter::new(slice));
+        rv.insert("split", BoxedFilter::new(split));
         #[cfg(feature = "json")]
         {
             rv.insert("tojson", BoxedFilter::new(tojson));
@@ -705,6 +706,36 @@ mod builtins {
                 Ok(rv)
             }
             _ => Ok(percent_encoding::utf8_percent_encode(&value.to_string(), SET).to_string()),
+        }
+    }
+
+    /// Split a string to a list a sequence by the delimiter
+    ///
+    /// ```jinja
+    /// {% for item in "Hello,World"|split(",") %}
+    ///   <dt>{{ item }}
+    /// {% endfor %}
+    /// -> <dt>Hello
+    /// -> <dt>World
+    /// ```
+    #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
+    pub fn split(_state: &State, val: Value, delimiter: Option<String>) -> Result<Value, Error> {
+        if val.is_undefined() || val.is_none() {
+            let vec: Vec<String> = Vec::new();
+            return Ok(Value::from(vec));
+        }
+
+        let delimiter = delimiter.as_ref().map_or(" ", |x| x.as_str());
+
+        if let Some(s) = val.as_str() {
+            let splited = s.split(delimiter);
+            let vec = splited.map(|s| s.to_string()).collect::<Vec<String>>();
+            Ok(Value::from(vec))
+        } else {
+            Err(Error::new(
+                ErrorKind::ImpossibleOperation,
+                format!("cannot split value of type {}", val.kind()),
+            ))
         }
     }
 
