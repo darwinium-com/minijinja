@@ -121,7 +121,7 @@
 #![allow(clippy::cognitive_complexity)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc(html_logo_url = "https://github.com/mitsuhiko/minijinja/raw/main/artwork/logo-square.png")]
-mod key;
+pub mod key;
 
 mod ast;
 mod compiler;

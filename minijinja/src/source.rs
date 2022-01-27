@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
+
+#[cfg_attr(docsrs, doc(cfg(feature = "file")))]
 use std::fs;
+#[cfg_attr(docsrs, doc(cfg(feature = "file")))]
 use std::path::Path;
 
 use self_cell::self_cell;
@@ -95,6 +98,7 @@ impl Source {
     /// This function takes two arguments: `path` which is the path to where the templates are
     /// stored and `extensions` which is a list of file extensions that should be considered to
     /// be templates.  Hidden files are always ignored.
+    #[cfg(feature = "file")]
     pub fn load_from_path<P: AsRef<Path>>(
         &mut self,
         path: P,

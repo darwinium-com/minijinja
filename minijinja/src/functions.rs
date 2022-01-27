@@ -198,7 +198,7 @@ mod builtins {
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn dict(_state: &State, value: Value) -> Result<Value, Error> {
         if value.is_undefined() {
-            Ok(Value::from(BTreeMap::<bool, Value>::new()))
+            Ok(Value::from(BTreeMap::<String, Value>::new()))
         } else if value.kind() != ValueKind::Map {
             Err(Error::from(ErrorKind::ImpossibleOperation))
         } else {

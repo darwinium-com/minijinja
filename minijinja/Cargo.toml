@@ -17,7 +17,8 @@ rustdoc-args = ["--cfg", "docsrs", "--html-in-header", "doc-header.html"]
 [features]
 default = ["builtins", "sync", "debug", "key_interning", "deserialization"]
 sync = []
-deserialization = []
+deserialization = ["serde"]
+serialization = ["serde"]
 key_interning = ["sync"]
 preserve_order = ["indexmap"]
 debug = ["sync"]
@@ -26,6 +27,7 @@ source = ["self_cell"]
 builtins = []
 json = ["serde_json"]
 urlencode = ["percent-encoding"]
+file = []           # to support template source from file
 
 # enables the Debug trait for some internal types
 internal_debug = []
@@ -33,7 +35,7 @@ internal_debug = []
 unstable_machinery = ["internal_debug"]
 
 [dependencies]
-serde = "1.0.130"
+serde = { version = "1.0.130", optional = true }
 v_htmlescape = { version = "0.14.1", optional = true }
 self_cell = { version = "0.10.1", optional = true, features = ["old_rust"] }
 serde_json = { version = "1.0.68", optional = true }
@@ -47,4 +49,4 @@ serde_yaml = "0.8.20"
 
 [[test]]
 name = "test_templates"
-required-features = ["unstable_machinery", "internal_debug"]
+required-features = ["unstable_machinery", "internal_debug", "serialization", "json", "dynamic_object"]

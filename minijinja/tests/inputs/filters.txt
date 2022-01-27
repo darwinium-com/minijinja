@@ -5,6 +5,7 @@ map:
   a: b
   c: d
 scary_html: "<>&'"
+string_with_space: "Hello World"
 ---
 lower: {{ word|lower }}
 upper: {{ word|upper }}
@@ -54,3 +55,4 @@ float-abs: {{ -42.5|abs }}
 int-round: {{ 42|round }}
 float-round: {{ 42.5|round }}
 float-round-prec2: {{ 42.512345|round(2) }}
+split: {{ string_with_space|split(" ") }}

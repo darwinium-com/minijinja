@@ -1,9 +1,8 @@
 use std::cmp::Ordering;
-use std::convert::TryFrom;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::num::TryFromIntError;
 
+#[cfg(feature = "serialization")]
 use serde::ser::{self, Impossible, Serialize, Serializer};
 
 use crate::error::{Error, ErrorKind};
@@ -12,19 +11,13 @@ use crate::value::{RcType, Value, ValueRepr};
 /// Represents a key in a value's map.
 #[derive(Clone)]
 pub enum Key<'a> {
-    Bool(bool),
-    I64(i64),
-    Char(char),
-    String(RcType<String>),
+    String(String),
     Str(&'a str),
 }
 
 impl<'a> fmt::Debug for Key<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Bool(val) => fmt::Debug::fmt(val, f),
-            Self::I64(val) => fmt::Debug::fmt(val, f),
-            Self::Char(val) => fmt::Debug::fmt(val, f),
             Self::String(val) => fmt::Debug::fmt(val, f),
             Self::Str(val) => fmt::Debug::fmt(val, f),
         }
@@ -33,22 +26,12 @@ impl<'a> fmt::Debug for Key<'a> {
 
 #[derive(PartialOrd, Ord, Eq, PartialEq, Hash)]
 enum InternalKeyRef<'a> {
-    Bool(bool),
-    I64(i64),
-    Char(char),
     Str(&'a str),
 }
 
 impl<'a> Key<'a> {
     pub fn make_string_key(s: &str) -> Key<'static> {
-        #[cfg(feature = "key_interning")]
-        {
-            Key::String(key_interning::try_intern(s))
-        }
-        #[cfg(not(feature = "key_interning"))]
-        {
-            Key::String(RcType::new(String::from(s)))
-        }
+        Key::String(String::from(s))
     }
 
     pub fn as_str(&self) -> Option<&str> {
@@ -61,9 +44,6 @@ impl<'a> Key<'a> {
 
     fn as_key_ref(&self) -> InternalKeyRef<'_> {
         match *self {
-            Key::Bool(x) => InternalKeyRef::Bool(x),
-            Key::I64(x) => InternalKeyRef::I64(x),
-            Key::Char(x) => InternalKeyRef::Char(x),
             Key::String(ref x) => InternalKeyRef::Str(x.as_str()),
             Key::Str(x) => InternalKeyRef::Str(x),
         }
@@ -71,30 +51,6 @@ impl<'a> Key<'a> {
 
     pub fn from_borrowed_value(value: &'a Value) -> Result<Key<'a>, Error> {
         match value.0 {
-            ValueRepr::Bool(v) => Ok(Key::Bool(v)),
-            ValueRepr::U64(v) => TryFrom::try_from(v)
-                .map(Key::I64)
-                .map_err(|_| ErrorKind::NonKey.into()),
-            ValueRepr::U128(ref v) => TryFrom::try_from(**v)
-                .map(Key::I64)
-                .map_err(|_| ErrorKind::NonKey.into()),
-            ValueRepr::I64(v) => Ok(Key::I64(v)),
-            ValueRepr::I128(ref v) => TryFrom::try_from(**v)
-                .map(Key::I64)
-                .map_err(|_| ErrorKind::NonKey.into()),
-            ValueRepr::F64(x) => {
-                // if a float is in fact looking like an integer we
-                // allow this to be used for indexing.  Why?  Because
-                // in Jinja division is always a division resuling
-                // in floating point values (4 / 2 == 2.0).
-                let intval = x as i64;
-                if intval as f64 == x {
-                    Ok(Key::I64(intval))
-                } else {
-                    Err(ErrorKind::NonKey.into())
-                }
-            }
-            ValueRepr::Char(c) => Ok(Key::Char(c)),
             ValueRepr::String(ref s) => Ok(Key::Str(s)),
             _ => Err(ErrorKind::NonKey.into()),
         }
@@ -132,41 +88,9 @@ type StaticKey = Key<'static>;
 impl<'a> fmt::Display for Key<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Key::Bool(val) => write!(f, "{}", val),
-            Key::I64(val) => write!(f, "{}", val),
-            Key::Char(val) => write!(f, "{}", val),
             Key::String(val) => write!(f, "{}", val),
             Key::Str(val) => write!(f, "{}", val),
         }
-    }
-}
-
-macro_rules! key_from {
-    ($src:ty, $dst:ident) => {
-        impl From<$src> for Key<'static> {
-            #[inline(always)]
-            fn from(val: $src) -> Self {
-                Key::$dst(val as _)
-            }
-        }
-    };
-}
-
-key_from!(bool, Bool);
-key_from!(u8, I64);
-key_from!(u16, I64);
-key_from!(u32, I64);
-key_from!(i8, I64);
-key_from!(i16, I64);
-key_from!(i32, I64);
-key_from!(i64, I64);
-key_from!(char, Char);
-
-impl TryFrom<u64> for Key<'static> {
-    type Error = TryFromIntError;
-
-    fn try_from(value: u64) -> Result<Self, Self::Error> {
-        TryFrom::try_from(value).map(Key::I64)
     }
 }
 
@@ -177,23 +101,29 @@ impl<'a> From<&'a str> for Key<'static> {
     }
 }
 
+impl<'a> From<String> for Key<'static> {
+    fn from(value: String) -> Self {
+        Key::String(value)
+    }
+}
+
+#[cfg(feature = "serialization")]
 impl<'a> Serialize for Key<'a> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         match *self {
-            Key::Bool(b) => serializer.serialize_bool(b),
-            Key::I64(i) => serializer.serialize_i64(i),
-            Key::Char(c) => serializer.serialize_char(c),
             Key::String(ref s) => serializer.serialize_str(s),
             Key::Str(s) => serializer.serialize_str(s),
         }
     }
 }
 
+#[cfg(feature = "serialization")]
 pub struct KeySerializer;
 
+#[cfg(feature = "serialization")]
 impl Serializer for KeySerializer {
     type Ok = StaticKey;
     type Error = Error;
@@ -207,23 +137,23 @@ impl Serializer for KeySerializer {
     type SerializeStructVariant = Impossible<StaticKey, Error>;
 
     fn serialize_bool(self, v: bool) -> Result<StaticKey, Error> {
-        Ok(Key::Bool(v))
+        Err(ser::Error::custom("unsupported key type bool"))
     }
 
     fn serialize_i8(self, v: i8) -> Result<StaticKey, Error> {
-        Ok(Key::I64(v as i64))
+        Err(ser::Error::custom("unsupported key type i8"))
     }
 
     fn serialize_i16(self, v: i16) -> Result<StaticKey, Error> {
-        Ok(Key::I64(v as i64))
+        Err(ser::Error::custom("unsupported key type i16"))
     }
 
     fn serialize_i32(self, v: i32) -> Result<StaticKey, Error> {
-        Ok(Key::I64(v as i64))
+        Err(ser::Error::custom("unsupported key type i32"))
     }
 
     fn serialize_i64(self, v: i64) -> Result<StaticKey, Error> {
-        Ok(Key::I64(v as i64))
+        Err(ser::Error::custom("unsupported key type i64"))
     }
 
     fn serialize_i128(self, _: i128) -> Result<StaticKey, Error> {
@@ -231,19 +161,19 @@ impl Serializer for KeySerializer {
     }
 
     fn serialize_u8(self, v: u8) -> Result<StaticKey, Error> {
-        Ok(Key::I64(v as i64))
+        Err(ser::Error::custom("unsupported key type u8"))
     }
 
     fn serialize_u16(self, v: u16) -> Result<StaticKey, Error> {
-        Ok(Key::I64(v as i64))
+        Err(ser::Error::custom("unsupported key type u16"))
     }
 
     fn serialize_u32(self, v: u32) -> Result<StaticKey, Error> {
-        Ok(Key::I64(v as i64))
+        Err(ser::Error::custom("unsupported key type u32"))
     }
 
     fn serialize_u64(self, v: u64) -> Result<StaticKey, Error> {
-        Key::try_from(v).map_err(|_| ser::Error::custom("out of bounds for i64"))
+        Err(ser::Error::custom("unsupported key type u64"))
     }
 
     fn serialize_u128(self, _: u128) -> Result<StaticKey, Error> {
@@ -259,7 +189,7 @@ impl Serializer for KeySerializer {
     }
 
     fn serialize_char(self, v: char) -> Result<StaticKey, Error> {
-        Ok(Key::Char(v))
+        Err(ser::Error::custom("unsupported key type char"))
     }
 
     fn serialize_str(self, value: &str) -> Result<StaticKey, Error> {
