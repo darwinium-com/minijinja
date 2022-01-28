@@ -8,10 +8,13 @@ use crate::compiler::Compiler;
 use crate::error::{Error, ErrorKind};
 use crate::instructions::Instructions;
 use crate::parser::{parse, parse_expr};
-use crate::utils::{AutoEscape, BTreeMapKeysDebug, HtmlEscape};
+use crate::utils::{AutoEscape, BTreeMapKeysDebug};
 use crate::value::{ArgType, FunctionArgs, RcType, Value};
 use crate::vm::Vm;
 use crate::{filters, functions, tests};
+
+#[cfg(feature = "htmlescape")]
+use crate::utils::HtmlEscape;
 
 /// Represents a handle to a template.
 ///
@@ -561,14 +564,27 @@ impl<'source> Environment<'source> {
             return Ok(());
         }
 
-        // TODO: this should become pluggable
         match autoescape {
             AutoEscape::None => write!(out, "{}", value).unwrap(),
             AutoEscape::Html => {
                 if let Some(s) = value.as_str() {
-                    write!(out, "{}", HtmlEscape(s)).unwrap()
+                    #[cfg(feature = "htmlescapte")]
+                    {
+                        write!(out, "{}", HtmlEscape(s)).unwrap()
+                    }
+                    #[cfg(not(feature = "htmlescapte"))]
+                    {
+                        write!(out, "{}", s).unwrap()
+                    }
                 } else {
-                    write!(out, "{}", HtmlEscape(&value.to_string())).unwrap()
+                    #[cfg(feature = "htmlescapte")]
+                    {
+                        write!(out, "{}", HtmlEscape(&value.to_string())).unwrap()
+                    }
+                    #[cfg(not(feature = "htmlescapte"))]
+                    {
+                        write!(out, "{}", &value.to_string()).unwrap()
+                    }
                 }
             }
         }

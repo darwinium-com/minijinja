@@ -37,8 +37,10 @@ pub enum AutoEscape {
 }
 
 /// Helper to HTML escape a string.
+#[cfg(feature = "htmlescape")]
 pub struct HtmlEscape<'a>(pub &'a str);
 
+#[cfg(feature = "htmlescape")]
 impl<'a> fmt::Display for HtmlEscape<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         #[cfg(feature = "v_htmlescape")]
@@ -190,6 +192,7 @@ impl<F: FnOnce()> Drop for OnDrop<F> {
 }
 
 #[test]
+#[cfg(feature = "htmlescape")]
 fn test_html_escape() {
     let input = "<>&\"'/";
     let output = HtmlEscape(input).to_string();

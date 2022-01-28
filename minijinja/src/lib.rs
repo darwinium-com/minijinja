@@ -149,7 +149,9 @@ mod source;
 
 pub use self::environment::{Environment, Expression, Template};
 pub use self::error::{Error, ErrorKind};
-pub use self::utils::{AutoEscape, HtmlEscape};
+pub use self::utils::{AutoEscape};
+#[cfg(feature = "htmlescape")]
+pub use self::utils::{HtmlEscape};
 
 #[cfg(feature = "debug")]
 pub use self::error::DebugInfo;
