@@ -257,11 +257,11 @@ pub(crate) enum ValueRepr {
     F64(f64),
     Char(char),
     None,
-    U128(RcType<u128>),
-    I128(RcType<i128>),
-    String(RcType<String>),
-    SafeString(RcType<String>),
-    Bytes(RcType<Vec<u8>>),
+    U128(u128),
+    I128(i128),
+    String(String),
+    SafeString(String),
+    Bytes(Vec<u8>),
     Seq(RcType<Vec<Value>>),
     Map(RcType<ValueMap<Key<'static>, Value>>),
     Dynamic(RcType<dyn Object>),
@@ -343,21 +343,21 @@ impl From<ValueRepr> for Value {
 impl<'a> From<&'a [u8]> for Value {
     #[inline(always)]
     fn from(val: &'a [u8]) -> Self {
-        ValueRepr::Bytes(RcType::new(val.into())).into()
+        ValueRepr::Bytes(val.into()).into()
     }
 }
 
 impl<'a> From<&'a str> for Value {
     #[inline(always)]
     fn from(val: &'a str) -> Self {
-        ValueRepr::String(RcType::new(val.into())).into()
+        ValueRepr::String(val.into()).into()
     }
 }
 
 impl From<String> for Value {
     #[inline(always)]
     fn from(val: String) -> Self {
-        ValueRepr::String(RcType::new(val)).into()
+        ValueRepr::String(val).into()
     }
 }
 
@@ -381,21 +381,21 @@ impl From<()> for Value {
 impl From<i128> for Value {
     #[inline(always)]
     fn from(val: i128) -> Self {
-        ValueRepr::I128(RcType::new(val)).into()
+        ValueRepr::I128(val).into()
     }
 }
 
 impl From<u128> for Value {
     #[inline(always)]
     fn from(val: u128) -> Self {
-        ValueRepr::U128(RcType::new(val)).into()
+        ValueRepr::U128(val).into()
     }
 }
 
 impl<'a> From<Key<'a>> for Value {
     fn from(val: Key) -> Self {
         match val {
-            Key::String(val) => ValueRepr::String(RcType::new(val)).into(),
+            Key::String(val) => ValueRepr::String(val).into(),
             Key::Str(val) => val.into(),
         }
     }
@@ -449,9 +449,9 @@ fn as_f64(value: &Value) -> Option<f64> {
     Some(match value.0 {
         ValueRepr::Bool(x) => x as i64 as f64,
         ValueRepr::U64(x) => x as f64,
-        ValueRepr::U128(ref x) => **x as f64,
+        ValueRepr::U128(ref x) => *x as f64,
         ValueRepr::I64(x) => x as f64,
-        ValueRepr::I128(ref x) => **x as f64,
+        ValueRepr::I128(ref x) => *x as f64,
         ValueRepr::F64(x) => x,
         _ => return None,
     })
@@ -462,10 +462,10 @@ fn coerce(a: &Value, b: &Value) -> Option<CoerceResult> {
         // equal mappings are trivial
         (ValueRepr::U64(a), ValueRepr::U64(b)) => Some(CoerceResult::I128(*a as i128, *b as i128)),
         (ValueRepr::U128(a), ValueRepr::U128(b)) => {
-            Some(CoerceResult::I128(**a as i128, **b as i128))
+            Some(CoerceResult::I128(*a as i128, *b as i128))
         }
         (ValueRepr::I64(a), ValueRepr::I64(b)) => Some(CoerceResult::I128(*a as i128, *b as i128)),
-        (ValueRepr::I128(ref a), ValueRepr::I128(ref b)) => Some(CoerceResult::I128(**a, **b)),
+        (ValueRepr::I128(ref a), ValueRepr::I128(ref b)) => Some(CoerceResult::I128(*a, *b)),
         (ValueRepr::F64(a), ValueRepr::F64(b)) => Some(CoerceResult::F64(*a, *b)),
 
         // are floats involved?
@@ -649,7 +649,7 @@ pub(crate) fn string_concat(mut left: Value, right: &Value) -> Value {
         // if we're a string and we have a single reference to it, we can
         // directly append into ourselves and reconstruct the value
         ValueRepr::String(ref mut s) => {
-            write!(RcType::make_mut(s), "{}", right).ok();
+            write!(s, "{}", right).ok();
             left
         }
         // otherwise we use format! to concat the two values
@@ -738,8 +738,8 @@ macro_rules! primitive_int_try_from {
             ValueRepr::U64(val) => val,
             // for the intention here see Key::from_borrowed_value
             ValueRepr::F64(val) if (val as i64 as f64 == val) => val as i64,
-            ValueRepr::I128(ref val) => **val,
-            ValueRepr::U128(ref val) => **val,
+            ValueRepr::I128(ref val) => *val,
+            ValueRepr::U128(ref val) => *val,
         });
     }
 }
@@ -843,7 +843,7 @@ impl Value {
 
     /// Creates a value from a safe string.
     pub fn from_safe_string(value: String) -> Value {
-        ValueRepr::SafeString(RcType::new(value)).into()
+        ValueRepr::SafeString(value).into()
     }
 
     /// Creates a value from a reference counted dynamic object.
@@ -933,9 +933,9 @@ impl Value {
         match self.0 {
             ValueRepr::Bool(val) => val,
             ValueRepr::U64(x) => x != 0,
-            ValueRepr::U128(ref x) => **x != 0,
+            ValueRepr::U128(ref x) => *x != 0,
             ValueRepr::I64(x) => x != 0,
-            ValueRepr::I128(ref x) => **x != 0,
+            ValueRepr::I128(ref x) => *x != 0,
             ValueRepr::F64(x) => x != 0.0,
             ValueRepr::Char(x) => x != '\x00',
             ValueRepr::String(ref x) => !x.is_empty(),
@@ -1142,8 +1142,8 @@ impl Serialize for Value {
             ValueRepr::Char(c) => serializer.serialize_char(c),
             ValueRepr::None => serializer.serialize_unit(),
             ValueRepr::Undefined => serializer.serialize_unit(),
-            ValueRepr::U128(ref u) => serializer.serialize_u128(**u),
-            ValueRepr::I128(ref i) => serializer.serialize_i128(**i),
+            ValueRepr::U128(ref u) => serializer.serialize_u128(*u),
+            ValueRepr::I128(ref i) => serializer.serialize_i128(*i),
             ValueRepr::String(ref s) => serializer.serialize_str(s),
             ValueRepr::SafeString(ref val) => serializer.serialize_str(val),
             ValueRepr::Bytes(ref b) => serializer.serialize_bytes(b),
@@ -1207,7 +1207,7 @@ impl Serializer for ValueSerializer {
     }
 
     fn serialize_i128(self, v: i128) -> Result<Value, Error> {
-        Ok(ValueRepr::I128(RcType::new(v)).into())
+        Ok(ValueRepr::I128(v).into())
     }
 
     fn serialize_u8(self, v: u8) -> Result<Value, Error> {
@@ -1227,7 +1227,7 @@ impl Serializer for ValueSerializer {
     }
 
     fn serialize_u128(self, v: u128) -> Result<Value, Error> {
-        Ok(ValueRepr::U128(RcType::new(v)).into())
+        Ok(ValueRepr::U128(v).into())
     }
 
     fn serialize_f32(self, v: f32) -> Result<Value, Error> {
@@ -1243,11 +1243,11 @@ impl Serializer for ValueSerializer {
     }
 
     fn serialize_str(self, value: &str) -> Result<Value, Error> {
-        Ok(ValueRepr::String(RcType::new(value.to_owned())).into())
+        Ok(ValueRepr::String(value.to_owned()).into())
     }
 
     fn serialize_bytes(self, value: &[u8]) -> Result<Value, Error> {
-        Ok(ValueRepr::Bytes(RcType::new(value.to_owned())).into())
+        Ok(ValueRepr::Bytes(value.to_owned()).into())
     }
 
     fn serialize_none(self) -> Result<Value, Error> {
@@ -1275,7 +1275,7 @@ impl Serializer for ValueSerializer {
         _variant_index: u32,
         variant: &'static str,
     ) -> Result<Value, Error> {
-        Ok(ValueRepr::String(RcType::new(variant.to_string())).into())
+        Ok(ValueRepr::String(variant.to_string()).into())
     }
 
     fn serialize_newtype_struct<T: ?Sized>(

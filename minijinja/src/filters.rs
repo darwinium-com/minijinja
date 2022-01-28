@@ -47,6 +47,7 @@
 use std::collections::BTreeMap;
 
 use crate::error::Error;
+#[cfg(feature = "htmlescape")]
 use crate::utils::HtmlEscape;
 use crate::value::{ArgType, FunctionArgs, RcType, Value};
 use crate::vm::State;
@@ -113,7 +114,9 @@ impl BoxedFilter {
 pub(crate) fn get_builtin_filters() -> BTreeMap<&'static str, BoxedFilter> {
     let mut rv = BTreeMap::new();
     rv.insert("safe", BoxedFilter::new(safe));
+    #[cfg(feature = "htmlescape")]
     rv.insert("escape", BoxedFilter::new(escape));
+    #[cfg(feature = "htmlescape")]
     rv.insert("e", BoxedFilter::new(escape));
     #[cfg(feature = "builtins")]
     {
@@ -164,9 +167,10 @@ pub fn escape(_state: &State, v: Value) -> Result<Value, Error> {
     if v.is_safe() {
         Ok(v)
     } else {
-        Ok(Value::from_safe_string(
-            HtmlEscape(&v.to_string()).to_string(),
-        ))
+        #[cfg(feature = "htmlescape")]
+        return Ok(Value::from_safe_string(HtmlEscape(&v.to_string()).to_string()));
+        #[cfg(not(feature = "htmlescape"))]
+        return Ok(Value::from_safe_string(v.to_string()));
     }
 }
 
