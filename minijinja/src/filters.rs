@@ -141,6 +141,7 @@ pub(crate) fn get_builtin_filters() -> BTreeMap<&'static str, BoxedFilter> {
         rv.insert("batch", BoxedFilter::new(batch));
         rv.insert("slice", BoxedFilter::new(slice));
         rv.insert("split", BoxedFilter::new(split));
+        rv.insert("contains", BoxedFilter::new(contains));
         #[cfg(feature = "json")]
         {
             rv.insert("tojson", BoxedFilter::new(tojson));
@@ -741,6 +742,18 @@ mod builtins {
                 format!("cannot split value of type {}", val.kind()),
             ))
         }
+    }
+
+    /// check whether a string in a map or sequence, or a string in another string
+    ///
+    #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
+    pub fn contains(_state: &State, val: Value, item: Option<String>) -> Result<Value, Error> {
+        if val.is_undefined() || val.is_none() || item.is_none(){
+            return Ok(Value::from(false));
+        }
+
+        let item = Value::from(item.unwrap());
+        crate::value::contains(&val, &item)
     }
 
     #[test]
