@@ -30,7 +30,6 @@ json = ["serde_json"]
 urlencode = ["percent-encoding"]
 file = []           # to support template source from file
 time_format = ["chrono"]
-base64_ops = ["base64"]
 
 # enables the Debug trait for some internal types
 internal_debug = []
