@@ -29,12 +29,13 @@ builtins = []
 json = ["serde_json"]
 urlencode = ["percent-encoding"]
 file = []           # to support template source from file
+time_format = ["chrono"]
+base64_ops = ["base64"]
 
 # enables the Debug trait for some internal types
 internal_debug = []
 # provides access to the unstable machinery
 unstable_machinery = ["internal_debug"]
-time_format = ["chrono"]
 
 [dependencies]
 serde = { version = "1.0.130", optional = true }
@@ -44,6 +45,7 @@ serde_json = { version = "1.0.68", optional = true }
 percent-encoding = { version = "2.1.0", optional = true }
 indexmap = { version = "1.7.0", optional = true }
 chrono = { version = "*", optional = true }
+base64 = { version = "*", optional = true }
 
 [dev-dependencies]
 insta = { version = "1.7.2", features = ["glob"] }

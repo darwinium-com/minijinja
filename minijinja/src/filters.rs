@@ -146,6 +146,11 @@ pub(crate) fn get_builtin_filters() -> BTreeMap<&'static str, BoxedFilter> {
         {
             rv.insert("strftime", BoxedFilter::new(strftime));
         }
+        #[cfg(feature = "base64")]
+        {
+            rv.insert("b64encode", BoxedFilter::new(b64encode));
+            rv.insert("b64decode", BoxedFilter::new(b64decode));
+        }
         #[cfg(feature = "json")]
         {
             rv.insert("tojson", BoxedFilter::new(tojson));
@@ -800,6 +805,47 @@ mod builtins {
         Ok(Value::from(
             utc_dt.format_with_items(ftime_items).to_string(),
         ))
+    }
+
+    /// convert a string to base64 encoding
+    ///
+    /// ```jinja
+    /// <h1>{{ value | b64encode }}</h1>
+    /// ```
+
+    #[cfg_attr(docsrs, doc(cfg(feature = "base64")))]
+    #[cfg(feature = "base64")]
+    pub fn b64encode(_state: &State, v: String) -> Result<String, Error> {
+        Ok(base64::encode(&v.into_bytes()))
+    }
+
+    /// decode the base64 string
+    ///
+    /// ```jinja
+    /// <h1>{{ value | b64decode }}</h1>
+    /// ```
+    #[cfg_attr(docsrs, doc(cfg(feature = "base64")))]
+    #[cfg(feature = "base64")]
+    pub fn b64decode(_state: &State, v: Value) -> Result<String, Error> {
+        let val = match v.0 {
+            ValueRepr::String(x) => x,
+            ValueRepr::SafeString(x) => x,
+
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::ImpossibleOperation,
+                    "b64decode only for value type String",
+                ))
+            }
+        };
+
+        match base64::decode(&val.into_bytes()) {
+            Ok(r) => match std::str::from_utf8(&r) {
+                Ok(r) => Ok(r.to_string()),
+                Err(_) => Ok(String::new()),
+            },
+            Err(_) => Ok(String::new()),
+        }
     }
 
     #[test]
