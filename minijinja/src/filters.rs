@@ -142,6 +142,10 @@ pub(crate) fn get_builtin_filters() -> BTreeMap<&'static str, BoxedFilter> {
         rv.insert("slice", BoxedFilter::new(slice));
         rv.insert("split", BoxedFilter::new(split));
         rv.insert("contains", BoxedFilter::new(contains));
+        #[cfg(feature = "time_format")]
+        {
+            rv.insert("strftime", BoxedFilter::new(strftime));
+        }
         #[cfg(feature = "json")]
         {
             rv.insert("tojson", BoxedFilter::new(tojson));
@@ -169,7 +173,10 @@ pub fn escape(_state: &State, v: Value) -> Result<Value, Error> {
         Ok(v)
     } else {
         #[cfg(feature = "htmlescape")]
-        return Ok(Value::from_safe_string(HtmlEscape(&v.to_string()).to_string()));
+        return Ok(Value::from_safe_string(
+            HtmlEscape(&v.to_string()).to_string(),
+        ));
+
         #[cfg(not(feature = "htmlescape"))]
         return Ok(Value::from_safe_string(v.to_string()));
     }
@@ -748,12 +755,51 @@ mod builtins {
     ///
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn contains(_state: &State, val: Value, item: Option<String>) -> Result<Value, Error> {
-        if val.is_undefined() || val.is_none() || item.is_none(){
+        if val.is_undefined() || val.is_none() || item.is_none() {
             return Ok(Value::from(false));
         }
 
         let item = Value::from(item.unwrap());
         crate::value::contains(&val, &item)
+    }
+
+    /// Format a time (Milliseconds since Epoch) to a string according the formator
+    /// formator according rust chrono
+    #[cfg(feature = "time_format")]
+    pub fn strftime(_state: &State, val: Value, specs: String) -> Result<Value, Error> {
+        use chrono::{DateTime, NaiveDateTime, Utc};
+
+        let ftime_items = chrono::format::strftime::StrftimeItems::new(&specs);
+        if ftime_items
+            .clone()
+            .any(|spec| spec == chrono::format::Item::Error)
+        {
+            return Err(Error::new(
+                ErrorKind::ImpossibleOperation,
+                format!("strftime invalid format {}", specs),
+            ));
+        }
+
+        let ms_since_epoch = match val.0 {
+            ValueRepr::I64(x) => x,
+            ValueRepr::U64(x) => x as i64,
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::ImpossibleOperation,
+                    "strftime only for value type Integer",
+                ))
+            }
+        };
+
+        let dt = NaiveDateTime::from_timestamp(
+            ms_since_epoch / 1_000,
+            (ms_since_epoch % 1_000 * 1_000_000) as u32,
+        );
+        let utc_dt: DateTime<Utc> = DateTime::from_utc(dt, Utc);
+
+        Ok(Value::from(
+            utc_dt.format_with_items(ftime_items).to_string(),
+        ))
     }
 
     #[test]
