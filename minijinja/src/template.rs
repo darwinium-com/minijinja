@@ -1,8 +1,6 @@
 use std::collections::BTreeMap;
 use std::{fmt, io};
 
-use serde::Serialize;
-
 use crate::compiler::codegen::CodeGenerator;
 use crate::compiler::instructions::Instructions;
 use crate::compiler::parser::parse;
@@ -81,10 +79,15 @@ impl<'env> Template<'env> {
     ///
     /// **Note on values:** The [`Value`] type implements `Serialize` and can be
     /// efficiently passed to render.  It does not undergo actual serialization.
-    pub fn render<S: Serialize>(&self, ctx: S) -> Result<String, Error> {
+    #[cfg(feature = "serde")]
+    pub fn render<S: serde::Serialize>(&self, ctx: S) -> Result<String, Error> {
         // reduce total amount of code faling under mono morphization into
         // this function, and share the rest in _render.
         self._render(Value::from_serializable(&ctx))
+    }
+
+    pub fn render_with_value(&self, root: Value) -> Result<String, Error> {
+        self._render(root)
     }
 
     fn _render(&self, root: Value) -> Result<String, Error> {
@@ -110,7 +113,8 @@ impl<'env> Template<'env> {
     ///
     /// **Note on values:** The [`Value`] type implements `Serialize` and can be
     /// efficiently passed to render.  It does not undergo actual serialization.
-    pub fn render_to_write<S: Serialize, W: io::Write>(&self, ctx: S, w: W) -> Result<(), Error> {
+    #[cfg(feature = "serde")]
+    pub fn render_to_write<S: serde::Serialize, W: io::Write>(&self, ctx: S, w: W) -> Result<(), Error> {
         let mut wrapper = WriteWrapper { w, err: None };
         self._eval(
             Value::from_serializable(&ctx),

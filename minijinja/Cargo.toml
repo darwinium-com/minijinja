@@ -17,11 +17,11 @@ features = ["source", "json", "urlencode"]
 rustdoc-args = ["--cfg", "docsrs", "--html-in-header", "doc-header.html"]
 
 [features]
-default = ["builtins", "debug", "key_interning", "deserialization", "macros", "multi-template", "adjacent-loop-items"]
+default = ["builtins", "debug", "key_interning", "deserialization", "serde", "macros", "multi-template", "adjacent-loop-items"]
 
 # API features
 preserve_order = ["indexmap"]
-deserialization = []
+deserialization = ["serde"]
 debug = []
 source = ["self_cell", "memo-map"]
 unicode = ["unicode-ident"]
@@ -36,6 +36,7 @@ macros = []
 multi-template = []
 adjacent-loop-items = []
 fuel = []
+htmlescape = ["v_htmlescape"]
 
 # Extra Filters
 json = ["serde_json"]
@@ -45,9 +46,11 @@ urlencode = ["percent-encoding"]
 internal_debug = []
 unstable_machinery = ["internal_debug"]
 unstable_machinery_serde = ["unstable_machinery", "serde/derive"]
+file = []           # to support template source from file
+time_format = ["chrono"]
 
 [dependencies]
-serde = "1.0.130"
+serde = { verison = "1.0.130", optional = true }
 v_htmlescape = { version = "0.15.8", optional = true }
 self_cell = { version = "0.10.1", optional = true }
 serde_json = { version = "1.0.68", optional = true }
@@ -55,6 +58,8 @@ percent-encoding = { version = "2.1.0", optional = true }
 indexmap = { version = "1.7.0", optional = true }
 memo-map = { version = "0.3.1", optional = true }
 unicode-ident = { version = "1.0.5", optional = true }
+chrono = { version = "*", optional = true }
+base64 = { version = "*", optional = true }
 
 [dev-dependencies]
 insta = { version = "1.26.0", features = ["glob", "serde"] }

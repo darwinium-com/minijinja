@@ -3,8 +3,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use serde::Serialize;
-
 use crate::compiler::codegen::CodeGenerator;
 use crate::compiler::parser::parse_expr;
 use crate::error::{attach_basic_debug_info, Error};
@@ -212,7 +210,8 @@ impl<'source> Environment<'source> {
     ///
     /// **Note on values:** The [`Value`] type implements `Serialize` and can be
     /// efficiently passed to render.  It does not undergo actual serialization.
-    pub fn render_str<S: Serialize>(&self, source: &str, ctx: S) -> Result<String, Error> {
+    #[cfg(feature = "serde")]
+    pub fn render_str<S: serde::Serialize>(&self, source: &str, ctx: S) -> Result<String, Error> {
         // reduce total amount of code faling under mono morphization into
         // this function, and share the rest in _eval.
         self._render_str("<string>", source, Value::from_serializable(&ctx))
@@ -236,7 +235,8 @@ impl<'source> Environment<'source> {
     ///
     /// **Note on values:** The [`Value`] type implements `Serialize` and can be
     /// efficiently passed to render.  It does not undergo actual serialization.
-    pub fn render_named_str<S: Serialize>(
+    #[cfg(feature = "serde")]
+    pub fn render_named_str<S: serde::Serialize>(
         &self,
         name: &str,
         source: &str,

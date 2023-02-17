@@ -1123,6 +1123,127 @@ mod builtins {
         Ok(rv)
     }
 
+    /// Split a string to a list a sequence by the delimiter
+    ///
+    /// ```jinja
+    /// {% for item in "Hello,World"|split(",") %}
+    ///   <dt>{{ item }}
+    /// {% endfor %}
+    /// -> <dt>Hello
+    /// -> <dt>World
+    /// ```
+    #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
+    pub fn split(_state: &State, val: Value, delimiter: Option<String>) -> Result<Value, Error> {
+        if val.is_undefined() || val.is_none() {
+            let vec: Vec<String> = Vec::new();
+            return Ok(Value::from(vec));
+        }
+
+        let delimiter = delimiter.as_ref().map_or(" ", |x| x.as_str());
+
+        if let Some(s) = val.as_str() {
+            let splited = s.split(delimiter);
+            let vec = splited.map(|s| s.to_string()).collect::<Vec<String>>();
+            Ok(Value::from(vec))
+        } else {
+            Err(Error::new(
+                ErrorKind::InvalidOperation,
+                format!("cannot split value of type {}", val.kind()),
+            ))
+        }
+    }
+
+    /// check whether a string in a map or sequence, or a string in another string
+    ///
+    #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
+    pub fn contains(_state: &State, val: Value, item: Option<String>) -> Result<Value, Error> {
+        if val.is_undefined() || val.is_none() || item.is_none() {
+            return Ok(Value::from(false));
+        }
+
+        let item = Value::from(item.unwrap());
+        crate::value::ops::contains(&val, &item)
+    }
+
+    /// Format a time (Milliseconds since Epoch) to a string according the formator
+    /// formator according rust chrono
+    #[cfg(feature = "time_format")]
+    pub fn strftime(_state: &State, val: Value, specs: String) -> Result<Value, Error> {
+        use chrono::{DateTime, NaiveDateTime, Utc};
+
+        let ftime_items = chrono::format::strftime::StrftimeItems::new(&specs);
+        if ftime_items
+            .clone()
+            .any(|spec| spec == chrono::format::Item::Error)
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidOperation,
+                format!("strftime invalid format {}", specs),
+            ));
+        }
+
+        let ms_since_epoch = match val.0 {
+            ValueRepr::I64(x) => x,
+            ValueRepr::U64(x) => x as i64,
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    "strftime only for value type Integer",
+                ))
+            }
+        };
+
+        let dt = NaiveDateTime::from_timestamp(
+            ms_since_epoch / 1_000,
+            (ms_since_epoch % 1_000 * 1_000_000) as u32,
+        );
+        let utc_dt: DateTime<Utc> = DateTime::from_utc(dt, Utc);
+
+        Ok(Value::from(
+            utc_dt.format_with_items(ftime_items).to_string(),
+        ))
+    }
+
+    /// convert a string to base64 encoding
+    ///
+    /// ```jinja
+    /// <h1>{{ value | b64encode }}</h1>
+    /// ```
+
+    #[cfg_attr(docsrs, doc(cfg(feature = "base64")))]
+    #[cfg(feature = "base64")]
+    pub fn b64encode(_state: &State, v: String) -> Result<String, Error> {
+        Ok(base64::encode(v.into_bytes()))
+    }
+
+    /// decode the base64 string
+    ///
+    /// ```jinja
+    /// <h1>{{ value | b64decode }}</h1>
+    /// ```
+    #[cfg_attr(docsrs, doc(cfg(feature = "base64")))]
+    #[cfg(feature = "base64")]
+    pub fn b64decode(_state: &State, v: Value) -> Result<String, Error> {
+        let val = match v.0 {
+            ValueRepr::String(x, _) => x,
+
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    "b64decode only for value type String",
+                ))
+            }
+        };
+
+        match base64::decode(val.as_bytes()) {
+            Ok(r) => match std::str::from_utf8(&r) {
+                Ok(r) => Ok(r.to_string()),
+                Err(_) => Ok(String::new()),
+            },
+            Err(_) => Ok(String::new()),
+        }
+    }
+
     #[test]
     fn test_basics() {
         fn test(a: u32, b: u32) -> Result<u32, Error> {

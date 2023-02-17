@@ -87,6 +87,17 @@ pub(crate) fn get_builtin_filters() -> BTreeMap<Cow<'static, str>, filters::Boxe
         rv.insert("selectattr".into(), BoxedFilter::new(filters::selectattr));
         rv.insert("rejectattr".into(), BoxedFilter::new(filters::rejectattr));
         rv.insert("map".into(), BoxedFilter::new(filters::map));
+        rv.insert("split", BoxedFilter::new(filters::split));
+        rv.insert("contains", BoxedFilter::new(filters::contains));
+        #[cfg(feature = "time_format")]
+        {
+            rv.insert("strftime", BoxedFilter::new(filters::strftime));
+        }
+        #[cfg(feature = "base64")]
+        {
+            rv.insert("b64encode", BoxedFilter::new(filters::b64encode));
+            rv.insert("b64decode", BoxedFilter::new(filters::b64decode));
+        }
 
         #[cfg(feature = "json")]
         {

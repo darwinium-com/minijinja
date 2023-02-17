@@ -111,14 +111,11 @@ use std::marker::PhantomData;
 use std::sync::atomic::{self, AtomicBool, AtomicUsize};
 use std::sync::Arc;
 
-use serde::ser::{Serialize, Serializer};
-
 use crate::error::{Error, ErrorKind};
 use crate::functions;
 use crate::key::{Key, StaticKey};
 use crate::utils::OnDrop;
 use crate::value::object::{SimpleSeqObject, SimpleStructObject};
-use crate::value::serialize::ValueSerializer;
 use crate::vm::State;
 
 pub use crate::value::argtypes::{from_args, ArgType, FunctionArgs, FunctionResult, Rest};
@@ -129,6 +126,7 @@ mod argtypes;
 mod deserialize;
 mod object;
 pub(crate) mod ops;
+#[cfg(feature = "serde")]
 mod serialize;
 
 #[cfg(test)]
@@ -452,8 +450,9 @@ impl Value {
     /// # use minijinja::value::Value;
     /// let val = Value::from_serializable(&vec![1, 2, 3]);
     /// ```
-    pub fn from_serializable<T: Serialize>(value: &T) -> Value {
-        with_internal_serialization(|| Serialize::serialize(value, ValueSerializer).unwrap())
+    #[cfg(feature = "serde")]
+    pub fn from_serializable<T: serde::Serialize>(value: &T) -> Value {
+        with_internal_serialization(|| serde::Serialize::serialize(value, crate::value::serialize::ValueSerializer).unwrap())
     }
 
     /// Creates a value from a safe string.
@@ -988,10 +987,11 @@ impl Value {
     }
 }
 
-impl Serialize for Value {
+#[cfg(feature = "serde")]
+impl serde::Serialize for Value {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: Serializer,
+        S: serde::Serializer,
     {
         // enable round tripping of values
         if serializing_for_value() {
