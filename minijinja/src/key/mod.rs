@@ -8,10 +8,12 @@ use std::sync::Arc;
 use crate::error::{Error, ErrorKind};
 use crate::value::{Value, ValueRepr};
 
+#[cfg(feature = "serde")]
 pub use crate::key::serialize::KeySerializer;
 
 #[cfg(feature = "deserialization")]
 mod deserialize;
+#[cfg(feature = "serde")]
 mod serialize;
 
 /// Represents a key in a value's map.
