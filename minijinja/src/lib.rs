@@ -186,7 +186,7 @@ mod defaults;
 mod environment;
 mod error;
 mod expression;
-mod key;
+pub mod key;
 mod output;
 mod template;
 mod utils;
@@ -217,7 +217,6 @@ pub use self::source::Source;
 
 pub use self::macros::__context;
 pub use self::vm::State;
-pub use key::Key;
 
 /// This module gives access to the low level machinery.
 ///
