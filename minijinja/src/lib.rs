@@ -217,6 +217,7 @@ pub use self::source::Source;
 
 pub use self::macros::__context;
 pub use self::vm::State;
+pub use key::Key;
 
 /// This module gives access to the low level machinery.
 ///
