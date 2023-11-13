@@ -275,6 +275,34 @@ mod builtins {
         matches!(v.kind(), ValueKind::Number)
     }
 
+    /// Checks if this value is an integer.
+    ///
+    /// ```jinja
+    /// {{ 42 is integer }} -> true
+    /// {{ 42.0 is integer }} -> false
+    /// ```
+    #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
+    pub fn is_integer(v: Value) -> bool {
+        matches!(
+            v.0,
+            crate::value::ValueRepr::U64(_)
+                | crate::value::ValueRepr::I64(_)
+                | crate::value::ValueRepr::U128(_)
+                | crate::value::ValueRepr::I128(_)
+        )
+    }
+
+    /// Checks if this value is a float
+    ///
+    /// ```jinja
+    /// {{ 42 is float }} -> false
+    /// {{ 42.0 is float }} -> true
+    /// ```
+    #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
+    pub fn is_float(v: Value) -> bool {
+        matches!(v.0, crate::value::ValueRepr::F64(_))
+    }
+
     /// Checks if this value is a string.
     ///
     /// ```jinja
@@ -311,8 +339,8 @@ mod builtins {
     /// Checks if the value is starting with a string.
     ///
     /// ```jinja
-    /// {{ "foobar" is startingwith "foo" }} -> true
-    /// {{ "foobar" is startingwith "bar" }} -> false
+    /// {{ "foobar" is startingwith("foo") }} -> true
+    /// {{ "foobar" is startingwith("bar") }} -> false
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn is_startingwith(v: Cow<'_, str>, other: Cow<'_, str>) -> bool {
@@ -322,8 +350,8 @@ mod builtins {
     /// Checks if the value is ending with a string.
     ///
     /// ```jinja
-    /// {{ "foobar" is endingwith "bar" }} -> true
-    /// {{ "foobar" is endingwith "foo" }} -> false
+    /// {{ "foobar" is endingwith("bar") }} -> true
+    /// {{ "foobar" is endingwith("foo") }} -> false
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn is_endingwith(v: Cow<'_, str>, other: Cow<'_, str>) -> bool {
@@ -442,20 +470,48 @@ mod builtins {
             .unwrap_or(false)
     }
 
-    #[test]
-    fn test_basics() {
-        fn test(_: &State, a: u32, b: u32) -> bool {
-            assert_eq!(a, 23);
-            a == b
-        }
+    /// Checks if a value is `true`.
+    ///
+    /// ```jinja
+    /// {% if value is true %}...{% endif %}
+    /// ```
+    #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
+    #[cfg(feature = "builtins")]
+    pub fn is_true(value: &Value) -> bool {
+        matches!(value.0, crate::value::ValueRepr::Bool(true))
+    }
 
-        let env = crate::Environment::new();
-        State::with_dummy(&env, |state| {
-            let bx = BoxedTest::new(test);
-            assert!(bx
-                .perform(state, &[Value::from(23), Value::from(23)][..])
-                .unwrap());
-        });
+    /// Checks if a value is `false`.
+    ///
+    /// ```jinja
+    /// {% if value is false %}...{% endif %}
+    /// ```
+    #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
+    #[cfg(feature = "builtins")]
+    pub fn is_false(value: &Value) -> bool {
+        matches!(value.0, crate::value::ValueRepr::Bool(false))
+    }
+
+    /// Checks if a filter with a given name is available.
+    ///
+    /// ```jinja
+    /// {% if 'tojson' is filter %}...{% endif %}
+    /// ```
+    #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
+    #[cfg(feature = "builtins")]
+    pub fn is_filter(state: &State, name: &str) -> bool {
+        state.env.get_filter(name).is_some()
+    }
+
+    /// Checks if a test with a given name is available.
+    ///
+    /// ```jinja
+    /// {% if 'greaterthan' is test %}...{% endif %}
+    /// ```
+    #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
+    #[cfg(feature = "builtins")]
+    pub fn is_test(state: &State, name: &str) -> bool {
+        state.env.get_test(name).is_some()
     }
 }
 

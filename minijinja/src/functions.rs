@@ -44,7 +44,7 @@
 //!
 //! MiniJinja inherits a lot of the runtime model from Jinja2.  That includes support for
 //! keyword arguments.  These however are a concept not native to Rust which makes them
-//! somewhat unconfortable to work with.  In MiniJinja keyword arguments are implemented by
+//! somewhat uncomfortable to work with.  In MiniJinja keyword arguments are implemented by
 //! converting them into an extra parameter represented by a map.  That means if you call
 //! a function as `foo(1, 2, three=3, four=4)` the function gets three arguments:
 //!
@@ -52,9 +52,10 @@
 //! [1, 2, {"three": 3, "four": 4}]
 //! ```
 //!
-//! If a function wants to disambiugate between a value passed as keyword argument or not,
-//! the the [`Value::is_kwargs`] can be used which returns `true` if a value represents
-//! keyword arguments as opposed to just a map.
+//! If a function wants to disambiguate between a value passed as keyword argument or not,
+//! the [`Value::is_kwargs`] can be used which returns `true` if a value represents
+//! keyword arguments as opposed to just a map.  A more convenient way to work with keyword
+//! arguments is the [`Kwargs`](crate::value::Kwargs) type.
 //!
 //! # Built-in Functions
 //!
@@ -94,9 +95,15 @@ pub(crate) struct BoxedFunction(Arc<FuncFunc>, #[cfg(feature = "debug")] &'stati
 /// The parameters can be marked optional by using `Option<T>`.  The last
 /// argument can also use [`Rest<T>`](crate::value::Rest) to capture the
 /// remaining arguments.  All types are supported for which
-/// [`ArgType`](crate::value::ArgType) is implemented.
+/// [`ArgType`] is implemented.
 ///
 /// For a list of built-in functions see [`functions`](crate::functions).
+///
+/// **Note:** this trait cannot be implemented and only exists drive the
+/// functionality of [`add_function`](crate::Environment::add_function)
+/// and [`from_function`](crate::value::Value::from_function).  If you want
+/// to implement a custom callable, you can directly implement
+/// [`Object::call`] which is what the engine actually uses internally.
 ///
 /// # Basic Example
 ///
@@ -201,10 +208,10 @@ impl fmt::Debug for BoxedFunction {
         #[cfg(feature = "debug")]
         {
             if !self.1.is_empty() {
-                return write!(f, "{}", self.1);
+                return f.write_str(self.1);
             }
         }
-        write!(f, "function")
+        f.write_str("function")
     }
 }
 
@@ -227,7 +234,7 @@ mod builtins {
     use std::collections::BTreeMap;
 
     use crate::error::ErrorKind;
-    use crate::value::ValueKind;
+    use crate::value::{MapType, Rest, ValueRepr};
 
     /// Returns a range.
     ///
@@ -289,28 +296,34 @@ mod builtins {
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn dict(value: Value) -> Result<Value, Error> {
-        if value.is_undefined() {
-            Ok(Value::from(BTreeMap::<bool, Value>::new()))
-        } else if value.kind() != ValueKind::Map {
-            Err(Error::from(ErrorKind::InvalidOperation))
-        } else {
-            Ok(value)
+        match value.0 {
+            ValueRepr::Undefined => Ok(Value::from(BTreeMap::<bool, Value>::new())),
+            ValueRepr::Map(map, _) => Ok(Value(ValueRepr::Map(map, MapType::Normal))),
+            _ => Err(Error::from(ErrorKind::InvalidOperation)),
         }
     }
 
-    /// Outputs the current context stringified.
+    /// Outputs the current context or the arguments stringified.
     ///
     /// This is a useful function to quickly figure out the state of affairs
     /// in a template.  It emits a stringified debug dump of the current
     /// engine state including the layers of the context, the current block
-    /// and auto escaping setting.
+    /// and auto escaping setting.  The exact output is not defined and might
+    /// change from one version of Jinja2 to the next.
     ///
     /// ```jinja
     /// <pre>{{ debug() }}</pre>
+    /// <pre>{{ debug(variable1, variable2) }}</pre>
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn debug(state: &State) -> String {
-        format!("{state:#?}")
+    pub fn debug(state: &State, args: Rest<Value>) -> String {
+        if args.is_empty() {
+            format!("{state:#?}")
+        } else if args.len() == 1 {
+            format!("{:#?}", args.0[0])
+        } else {
+            format!("{:#?}", &args.0[..])
+        }
     }
 }
 

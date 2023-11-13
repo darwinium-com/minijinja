@@ -9,13 +9,15 @@
 //! filter to take a [`String`](std::string::String).  However for some more
 //! advanced use cases it's useful to know that this type exists.
 //!
-//! # Converting Values
+//! # Basic Value Conversions
 //!
 //! Values are typically created via the [`From`] trait:
 //!
 //! ```
 //! # use minijinja::value::Value;
-//! let value = Value::from(42);
+//! let int_value = Value::from(42);
+//! let none_value = Value::from(());
+//! let true_value = Value::from(true);
 //! ```
 //!
 //! Or via the [`FromIterator`] trait:
@@ -29,15 +31,6 @@
 //! let value: Value = [("key", "value")].into_iter().collect();
 //! ```
 //!
-//! MiniJinja will however create values via an indirection via [`serde`] when
-//! a template is rendered or an expression is evaluated.  This can also be
-//! triggered manually by using the [`Value::from_serializable`] method:
-//!
-//! ```
-//! # use minijinja::value::Value;
-//! let value = Value::from_serializable(&[1, 2, 3]);
-//! ```
-//!
 //! To to into the inverse directly the various [`TryFrom`](std::convert::TryFrom)
 //! implementations can be used:
 //!
@@ -46,6 +39,37 @@
 //! use std::convert::TryFrom;
 //! let v = u64::try_from(Value::from(42)).unwrap();
 //! ```
+//!
+//! The special [`Undefined`](Value::UNDEFINED) value also exists but does not
+//! have a rust equivalent.  It can be created via the [`UNDEFINED`](Value::UNDEFINED)
+//! constant.
+//!
+//! # Serde Conversions
+//!
+//! MiniJinja will usually however create values via an indirection via [`serde`] when
+//! a template is rendered or an expression is evaluated.  This can also be
+//! triggered manually by using the [`Value::from_serializable`] method:
+//!
+//! ```
+//! # use minijinja::value::Value;
+//! let value = Value::from_serializable(&[1, 2, 3]);
+//! ```
+//!
+//! The inverse of that operation is to pass a value directly as serializer to
+//! a type that supports deserialization.  This requires the `deserialization`
+//! feature.
+//!
+#![cfg_attr(
+    feature = "deserialization",
+    doc = r"
+```
+# use minijinja::value::Value;
+use serde::Deserialize;
+let value = Value::from(vec![1, 2, 3]);
+let vec = Vec::<i32>::deserialize(value).unwrap();
+```
+"
+)]
 //!
 //! # Value Function Arguments
 //!
@@ -62,7 +86,7 @@
 //! # HTML Escaping
 //!
 //! MiniJinja inherits the general desire to be clever about escaping.  For this
-//! prupose a value will (when auto escaping is enabled) always be escaped.  To
+//! purpose a value will (when auto escaping is enabled) always be escaped.  To
 //! prevent this behavior the [`safe`](crate::filters::safe) filter can be used
 //! in the template.  Outside of templates the [`Value::from_safe_string`] method
 //! can be used to achieve the same result.
@@ -101,54 +125,71 @@
 // this module is based on the content module in insta which in turn is based
 // on the content module in serde::private::ser.
 
-use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
-use std::sync::atomic::{self, AtomicBool, AtomicUsize};
 use std::sync::Arc;
 
 use crate::error::{Error, ErrorKind};
 use crate::functions;
-use crate::key::{Key, StaticKey};
 use crate::utils::OnDrop;
 use crate::value::object::{SimpleSeqObject, SimpleStructObject};
+use crate::value::ops::as_f64;
+use crate::value::serialize::transform;
 use crate::vm::State;
 
-pub use crate::value::argtypes::{from_args, ArgType, FunctionArgs, FunctionResult, Rest};
+pub use crate::value::argtypes::{from_args, ArgType, FunctionArgs, FunctionResult, Kwargs, Rest};
 pub use crate::value::object::{Object, ObjectKind, SeqObject, SeqObjectIter, StructObject};
 
 mod argtypes;
 #[cfg(feature = "deserialization")]
 mod deserialize;
+mod keyref;
+pub(crate) mod merge_object;
 mod object;
 pub(crate) mod ops;
 #[cfg(feature = "serde")]
 mod serialize;
 
-#[cfg(test)]
-use similar_asserts::assert_eq;
+#[cfg(feature = "deserialization")]
+pub use self::deserialize::ViaDeserialize;
+
+pub(crate) use crate::value::keyref::KeyRef;
 
 // We use in-band signalling to roundtrip some internal values.  This is
 // not ideal but unfortunately there is no better system in serde today.
 const VALUE_HANDLE_MARKER: &str = "\x01__minijinja_ValueHandle";
 
 #[cfg(feature = "preserve_order")]
-pub(crate) type ValueMap = indexmap::IndexMap<StaticKey, Value>;
+pub(crate) type ValueMap = indexmap::IndexMap<KeyRef<'static>, Value>;
 
 #[cfg(not(feature = "preserve_order"))]
-pub(crate) type ValueMap = std::collections::BTreeMap<StaticKey, Value>;
+pub(crate) type ValueMap = std::collections::BTreeMap<KeyRef<'static>, Value>;
+
+#[inline(always)]
+pub(crate) fn value_map_with_capacity(capacity: usize) -> ValueMap {
+    #[cfg(not(feature = "preserve_order"))]
+    {
+        let _ = capacity;
+        ValueMap::new()
+    }
+    #[cfg(feature = "preserve_order")]
+    {
+        ValueMap::with_capacity(crate::utils::untrusted_size_hint(capacity))
+    }
+}
 
 thread_local! {
-    static INTERNAL_SERIALIZATION: AtomicBool = AtomicBool::new(false);
+    static INTERNAL_SERIALIZATION: Cell<bool> = Cell::new(false);
 
     // This should be an AtomicU64 but sadly 32bit targets do not necessarily have
     // AtomicU64 available.
-    static LAST_VALUE_HANDLE: AtomicUsize = AtomicUsize::new(0);
-    static VALUE_HANDLES: RefCell<BTreeMap<usize, Value>> = RefCell::new(BTreeMap::new());
+    static LAST_VALUE_HANDLE: Cell<u32> = Cell::new(0);
+    static VALUE_HANDLES: RefCell<BTreeMap<u32, Value>> = RefCell::new(BTreeMap::new());
 }
 
 /// Function that returns true when serialization for [`Value`] is taking place.
@@ -168,36 +209,35 @@ thread_local! {
 /// gets sent there, even at the cost of serializing something that cannot be
 /// deserialized.
 pub fn serializing_for_value() -> bool {
-    INTERNAL_SERIALIZATION.with(|flag| flag.load(atomic::Ordering::Relaxed))
+    INTERNAL_SERIALIZATION.with(|flag| flag.get())
 }
 
-/// Enables a temporary code section within which some value
-/// optimizations are enabled.  Currently this is exclusively
-/// used to automatically intern keys when the `key_interning`
-/// feature is enabled.
+/// Enables value optimizations.
+///
+/// If `key_interning` is enabled, this turns on that feature, otherwise
+/// it becomes a noop.
 #[inline(always)]
-pub(crate) fn with_value_optimization<R, F: FnOnce() -> R>(f: F) -> R {
-    #[cfg(not(feature = "key_interning"))]
-    {
-        f()
-    }
+pub(crate) fn value_optimization() -> impl Drop {
     #[cfg(feature = "key_interning")]
     {
-        crate::key::key_interning::with(f)
+        crate::value::keyref::key_interning::use_string_cache()
+    }
+    #[cfg(not(feature = "key_interning"))]
+    {
+        OnDrop::new(|| {})
     }
 }
 
-/// Executes code within the context of internal serialization
-/// which causes the value type to enable the internal round
-/// tripping serialization.
-fn with_internal_serialization<R, F: FnOnce() -> R>(f: F) -> R {
-    INTERNAL_SERIALIZATION.with(|flag| {
-        let old = flag.load(atomic::Ordering::Relaxed);
-        flag.store(true, atomic::Ordering::Relaxed);
-        let _on_drop = OnDrop::new(|| {
-            flag.store(old, atomic::Ordering::Relaxed);
-        });
-        with_value_optimization(f)
+fn mark_internal_serialization() -> impl Drop {
+    let old = INTERNAL_SERIALIZATION.with(|flag| {
+        let old = flag.get();
+        flag.set(true);
+        old
+    });
+    OnDrop::new(move || {
+        if !old {
+            INTERNAL_SERIALIZATION.with(|flag| flag.set(false));
+        }
     })
 }
 
@@ -212,8 +252,6 @@ pub enum ValueKind {
     Bool,
     /// The value is a number of a supported type.
     Number,
-    /// The value is a character.
-    Char,
     /// The value is a string.
     String,
     /// The value is a byte array.
@@ -226,18 +264,16 @@ pub enum ValueKind {
 
 impl fmt::Display for ValueKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let ty = match *self {
+        f.write_str(match *self {
             ValueKind::Undefined => "undefined",
             ValueKind::None => "none",
             ValueKind::Bool => "bool",
             ValueKind::Number => "number",
-            ValueKind::Char => "char",
             ValueKind::String => "string",
             ValueKind::Bytes => "bytes",
             ValueKind::Seq => "sequence",
             ValueKind::Map => "map",
-        };
-        write!(f, "{ty}")
+        })
     }
 }
 
@@ -267,7 +303,7 @@ pub(crate) struct Packed<T: Copy>(pub T);
 
 impl<T: Copy> Clone for Packed<T> {
     fn clone(&self) -> Self {
-        Self(self.0)
+        *self
     }
 }
 
@@ -278,11 +314,11 @@ pub(crate) enum ValueRepr {
     U64(u64),
     I64(i64),
     F64(f64),
-    Char(char),
     None,
+    Invalid(Arc<str>),
     U128(Packed<u128>),
     I128(Packed<i128>),
-    String(Arc<String>, StringType),
+    String(Arc<str>, StringType),
     Bytes(Arc<Vec<u8>>),
     Seq(Arc<Vec<Value>>),
     Map(Arc<ValueMap>, MapType),
@@ -292,13 +328,13 @@ pub(crate) enum ValueRepr {
 impl fmt::Debug for ValueRepr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ValueRepr::Undefined => write!(f, "Undefined"),
+            ValueRepr::Undefined => f.write_str("undefined"),
             ValueRepr::Bool(val) => fmt::Debug::fmt(val, f),
             ValueRepr::U64(val) => fmt::Debug::fmt(val, f),
             ValueRepr::I64(val) => fmt::Debug::fmt(val, f),
             ValueRepr::F64(val) => fmt::Debug::fmt(val, f),
-            ValueRepr::Char(val) => fmt::Debug::fmt(val, f),
-            ValueRepr::None => write!(f, "None"),
+            ValueRepr::None => f.write_str("none"),
+            ValueRepr::Invalid(ref val) => write!(f, "<invalid value: {}>", val),
             ValueRepr::U128(val) => fmt::Debug::fmt(&{ val.0 }, f),
             ValueRepr::I128(val) => fmt::Debug::fmt(&{ val.0 }, f),
             ValueRepr::String(val, _) => fmt::Debug::fmt(val, f),
@@ -306,6 +342,51 @@ impl fmt::Debug for ValueRepr {
             ValueRepr::Seq(val) => fmt::Debug::fmt(val, f),
             ValueRepr::Map(val, _) => fmt::Debug::fmt(val, f),
             ValueRepr::Dynamic(val) => fmt::Debug::fmt(val, f),
+        }
+    }
+}
+
+impl Hash for Value {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match &self.0 {
+            ValueRepr::None | ValueRepr::Undefined => 0u8.hash(state),
+            ValueRepr::String(ref s, _) => s.hash(state),
+            ValueRepr::Bool(b) => b.hash(state),
+            ValueRepr::Invalid(s) => s.hash(state),
+            ValueRepr::Bytes(b) => b.hash(state),
+            ValueRepr::Seq(b) => b.hash(state),
+            ValueRepr::Map(m, _) => m.iter().for_each(|(k, v)| {
+                k.hash(state);
+                v.hash(state);
+            }),
+            ValueRepr::Dynamic(d) => match d.kind() {
+                ObjectKind::Plain => 0u8.hash(state),
+                ObjectKind::Seq(s) => s.iter().for_each(|x| x.hash(state)),
+                ObjectKind::Struct(s) => {
+                    if let Some(fields) = s.static_fields() {
+                        fields.iter().for_each(|k| {
+                            k.hash(state);
+                            s.get_field(k).hash(state);
+                        });
+                    } else {
+                        s.fields().iter().for_each(|k| {
+                            k.hash(state);
+                            s.get_field(k).hash(state);
+                        });
+                    }
+                }
+            },
+            ValueRepr::U64(_)
+            | ValueRepr::I64(_)
+            | ValueRepr::F64(_)
+            | ValueRepr::U128(_)
+            | ValueRepr::I128(_) => {
+                if let Ok(val) = i64::try_from(self.clone()) {
+                    val.hash(state)
+                } else {
+                    as_f64(self).map(|x| x.to_bits()).hash(state)
+                }
+            }
         }
     }
 }
@@ -318,13 +399,29 @@ impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (&self.0, &other.0) {
             (ValueRepr::None, ValueRepr::None) => true,
+            (ValueRepr::Undefined, ValueRepr::Undefined) => true,
             (ValueRepr::String(ref a, _), ValueRepr::String(ref b, _)) => a == b,
             (ValueRepr::Bytes(a), ValueRepr::Bytes(b)) => a == b,
             _ => match ops::coerce(self, other) {
                 Some(ops::CoerceResult::F64(a, b)) => a == b,
                 Some(ops::CoerceResult::I128(a, b)) => a == b,
                 Some(ops::CoerceResult::Str(a, b)) => a == b,
-                None => false,
+                None => {
+                    if let (Some(a), Some(b)) = (self.as_seq(), other.as_seq()) {
+                        a.iter().eq(b.iter())
+                    } else if self.kind() == ValueKind::Map && other.kind() == ValueKind::Map {
+                        if self.len() != other.len() {
+                            return false;
+                        }
+                        if let Ok(mut iter) = self.try_iter() {
+                            iter.all(|x| self.get_item_opt(&x) == other.get_item_opt(&x))
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                }
             },
         }
     }
@@ -334,16 +431,47 @@ impl Eq for Value {}
 
 impl PartialOrd for Value {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        match (&self.0, &other.0) {
-            (ValueRepr::None, ValueRepr::None) => Some(Ordering::Equal),
-            (ValueRepr::Bytes(a), ValueRepr::Bytes(b)) => a.partial_cmp(b),
+        Some(self.cmp(other))
+    }
+}
+
+fn f64_total_cmp(left: f64, right: f64) -> Ordering {
+    // this is taken from f64::total_cmp on newer rust versions
+    let mut left = left.to_bits() as i64;
+    let mut right = right.to_bits() as i64;
+    left ^= (((left >> 63) as u64) >> 1) as i64;
+    right ^= (((right >> 63) as u64) >> 1) as i64;
+    left.cmp(&right)
+}
+
+impl Ord for Value {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let value_ordering = match (&self.0, &other.0) {
+            (ValueRepr::None, ValueRepr::None) => Ordering::Equal,
+            (ValueRepr::Undefined, ValueRepr::Undefined) => Ordering::Equal,
+            (ValueRepr::String(ref a, _), ValueRepr::String(ref b, _)) => a.cmp(b),
+            (ValueRepr::Bytes(a), ValueRepr::Bytes(b)) => a.cmp(b),
             _ => match ops::coerce(self, other) {
-                Some(ops::CoerceResult::F64(a, b)) => a.partial_cmp(&b),
-                Some(ops::CoerceResult::I128(a, b)) => a.partial_cmp(&b),
-                Some(ops::CoerceResult::Str(a, b)) => a.partial_cmp(b),
-                None => None,
+                Some(ops::CoerceResult::F64(a, b)) => f64_total_cmp(a, b),
+                Some(ops::CoerceResult::I128(a, b)) => a.cmp(&b),
+                Some(ops::CoerceResult::Str(a, b)) => a.cmp(b),
+                None => {
+                    if let (Some(a), Some(b)) = (self.as_seq(), other.as_seq()) {
+                        a.iter().cmp(b.iter())
+                    } else if self.kind() == ValueKind::Map && other.kind() == ValueKind::Map {
+                        if let (Ok(a), Ok(b)) = (self.try_iter(), other.try_iter()) {
+                            a.map(|k| (k.clone(), self.get_item_opt(&k)))
+                                .cmp(b.map(|k| (k.clone(), other.get_item_opt(&k))))
+                        } else {
+                            Ordering::Equal
+                        }
+                    } else {
+                        Ordering::Equal
+                    }
+                }
             },
-        }
+        };
+        value_ordering.then((self.kind() as usize).cmp(&(other.kind() as usize)))
     }
 }
 
@@ -357,12 +485,12 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.0 {
             ValueRepr::Undefined => Ok(()),
-            ValueRepr::Bool(val) => write!(f, "{val}"),
-            ValueRepr::U64(val) => write!(f, "{val}"),
-            ValueRepr::I64(val) => write!(f, "{val}"),
+            ValueRepr::Bool(val) => val.fmt(f),
+            ValueRepr::U64(val) => val.fmt(f),
+            ValueRepr::I64(val) => val.fmt(f),
             ValueRepr::F64(val) => {
                 if val.is_nan() {
-                    write!(f, "NaN")
+                    f.write_str("NaN")
                 } else if val.is_infinite() {
                     write!(f, "{}inf", if val.is_sign_negative() { "-" } else { "" })
                 } else {
@@ -373,30 +501,30 @@ impl fmt::Display for Value {
                     write!(f, "{num}")
                 }
             }
-            ValueRepr::Char(val) => write!(f, "{val}"),
-            ValueRepr::None => write!(f, "none"),
+            ValueRepr::None => f.write_str("none"),
+            ValueRepr::Invalid(ref val) => write!(f, "<invalid value: {}>", val),
             ValueRepr::I128(val) => write!(f, "{}", { val.0 }),
             ValueRepr::String(val, _) => write!(f, "{val}"),
             ValueRepr::Bytes(val) => write!(f, "{}", String::from_utf8_lossy(val)),
             ValueRepr::Seq(values) => {
-                ok!(write!(f, "["));
+                ok!(f.write_str("["));
                 for (idx, val) in values.iter().enumerate() {
                     if idx > 0 {
-                        ok!(write!(f, ", "));
+                        ok!(f.write_str(", "));
                     }
                     ok!(write!(f, "{val:?}"));
                 }
-                write!(f, "]")
+                f.write_str("]")
             }
             ValueRepr::Map(m, _) => {
-                ok!(write!(f, "{{"));
+                ok!(f.write_str("{"));
                 for (idx, (key, val)) in m.iter().enumerate() {
                     if idx > 0 {
-                        ok!(write!(f, ", "));
+                        ok!(f.write_str(", "));
                     }
                     ok!(write!(f, "{key:?}: {val:?}"));
                 }
-                write!(f, "}}")
+                f.write_str("}")
             }
             ValueRepr::U128(val) => write!(f, "{}", { val.0 }),
             ValueRepr::Dynamic(x) => write!(f, "{x}"),
@@ -417,22 +545,23 @@ impl Default for Value {
 /// same functionality.  There is no guarantee that a string will be interned
 /// as there are heuristics involved for it.  Additionally the string interning
 /// will only work during the template engine execution (eg: within filters etc.).
-///
-/// ```
-/// use minijinja::value::{intern, Value};
-/// let val = Value::from(intern("my_key"));
-/// ```
-pub fn intern(s: &str) -> Arc<String> {
-    if let Key::String(ref s) = Key::make_string_key(s) {
-        s.clone()
-    } else {
-        unreachable!()
+pub fn intern(s: &str) -> Arc<str> {
+    #[cfg(feature = "key_interning")]
+    {
+        crate::value::keyref::key_interning::try_intern(s)
+    }
+    #[cfg(not(feature = "key_interning"))]
+    {
+        Arc::from(s.to_string())
     }
 }
 
 #[allow(clippy::len_without_is_empty)]
 impl Value {
-    /// The undefined value
+    /// The undefined value.
+    ///
+    /// This constant exists because the undefined type does not exist in Rust
+    /// and this is the only way to construct it.
     pub const UNDEFINED: Value = Value(ValueRepr::Undefined);
 
     /// Creates a value from something that can be serialized.
@@ -450,9 +579,23 @@ impl Value {
     /// # use minijinja::value::Value;
     /// let val = Value::from_serializable(&vec![1, 2, 3]);
     /// ```
-    #[cfg(feature = "serde")]
-    pub fn from_serializable<T: serde::Serialize>(value: &T) -> Value {
-        with_internal_serialization(|| serde::Serialize::serialize(value, crate::value::serialize::ValueSerializer).unwrap())
+    ///
+    /// This method does not fail but it might return a value that is not valid.  Such
+    /// values will when operated on fail in the template engine in most situations.
+    /// This for instance can happen if the underlying implementation of [`Serialize`]
+    /// fails.  There are also cases where invalid objects are silently hidden in the
+    /// engine today.  This is for instance the case for when keys are used in hash maps
+    /// that the engine cannot deal with.  Invalid values are considered an implementation
+    /// detail.  There is currently no API to validate a value.
+    ///
+    /// If the `deserialization` feature is enabled then the inverse of this method
+    /// is to use the [`Value`] type as serializer.  You can pass a value into the
+    /// [`deserialize`](serde::Deserialize::deserialize) method of a type that supports
+    /// serde deserialization.
+    pub fn from_serializable<T: Serialize>(value: &T) -> Value {
+        let _serialization_guard = mark_internal_serialization();
+        let _optimization_guard = value_optimization();
+        transform(value)
     }
 
     /// Creates a value from a safe string.
@@ -466,7 +609,7 @@ impl Value {
     /// let val = Value::from_safe_string("<em>note</em>".into());
     /// ```
     pub fn from_safe_string(value: String) -> Value {
-        ValueRepr::String(Arc::new(value), StringType::Safe).into()
+        ValueRepr::String(Arc::from(value), StringType::Safe).into()
     }
 
     /// Creates a value from a dynamic object.
@@ -517,9 +660,6 @@ impl Value {
     ///
     /// This is a simplified API for creating dynamic sequences
     /// without having to implement the entire [`Object`] protocol.
-    ///
-    /// **Note:** objects created this way cannot be downcasted via
-    /// [`downcast_object_ref`](Self::downcast_object_ref).
     pub fn from_seq_object<T: SeqObject + 'static>(value: T) -> Value {
         Value::from_object(SimpleSeqObject(value))
     }
@@ -528,9 +668,6 @@ impl Value {
     ///
     /// This is a simplified API for creating dynamic structs
     /// without having to implement the entire [`Object`] protocol.
-    ///
-    /// **Note:** objects created this way cannot be downcasted via
-    /// [`downcast_object_ref`](Self::downcast_object_ref).
     pub fn from_struct_object<T: StructObject + 'static>(value: T) -> Value {
         Value::from_object(SimpleStructObject(value))
     }
@@ -561,7 +698,6 @@ impl Value {
             ValueRepr::Undefined => ValueKind::Undefined,
             ValueRepr::Bool(_) => ValueKind::Bool,
             ValueRepr::U64(_) | ValueRepr::I64(_) | ValueRepr::F64(_) => ValueKind::Number,
-            ValueRepr::Char(_) => ValueKind::Char,
             ValueRepr::None => ValueKind::None,
             ValueRepr::I128(_) => ValueKind::Number,
             ValueRepr::String(..) => ValueKind::String,
@@ -569,6 +705,8 @@ impl Value {
             ValueRepr::U128(_) => ValueKind::Number,
             ValueRepr::Seq(_) => ValueKind::Seq,
             ValueRepr::Map(..) => ValueKind::Map,
+            // XXX: invalid values report themselves as maps which is a lie
+            ValueRepr::Invalid(_) => ValueKind::Map,
             ValueRepr::Dynamic(ref dy) => match dy.kind() {
                 // XXX: basic objects should probably not report as map
                 ObjectKind::Plain => ValueKind::Map,
@@ -576,6 +714,20 @@ impl Value {
                 ObjectKind::Struct(_) => ValueKind::Map,
             },
         }
+    }
+
+    /// Returns `true` if the value is a number.
+    ///
+    /// To convert a value into a primitive number, use [`TryFrom`] or [`TryInto`].
+    pub fn is_number(&self) -> bool {
+        matches!(
+            self.0,
+            ValueRepr::U64(_)
+                | ValueRepr::I64(_)
+                | ValueRepr::F64(_)
+                | ValueRepr::I128(_)
+                | ValueRepr::U128(_)
+        )
     }
 
     /// Returns `true` if the map represents keyword arguments.
@@ -592,10 +744,9 @@ impl Value {
             ValueRepr::I64(x) => x != 0,
             ValueRepr::I128(x) => x.0 != 0,
             ValueRepr::F64(x) => x != 0.0,
-            ValueRepr::Char(x) => x != '\x00',
             ValueRepr::String(ref x, _) => !x.is_empty(),
             ValueRepr::Bytes(ref x) => !x.is_empty(),
-            ValueRepr::None | ValueRepr::Undefined => false,
+            ValueRepr::None | ValueRepr::Undefined | ValueRepr::Invalid(_) => false,
             ValueRepr::Seq(ref x) => !x.is_empty(),
             ValueRepr::Map(ref x, _) => !x.is_empty(),
             ValueRepr::Dynamic(ref x) => match x.kind() {
@@ -624,7 +775,7 @@ impl Value {
     /// If the value is a string, return it.
     pub fn as_str(&self) -> Option<&str> {
         match &self.0 {
-            ValueRepr::String(ref s, _) => Some(s.as_str()),
+            ValueRepr::String(ref s, _) => Some(s as &str),
             _ => None,
         }
     }
@@ -710,21 +861,33 @@ impl Value {
     /// # Ok(()) }
     /// ```
     pub fn get_attr(&self, key: &str) -> Result<Value, Error> {
-        let value = match self.0 {
-            ValueRepr::Map(ref items, _) => {
-                let lookup_key = Key::Str(key);
-                items.get(&lookup_key).cloned()
-            }
+        Ok(match self.0 {
+            ValueRepr::Undefined => return Err(Error::from(ErrorKind::UndefinedError)),
+            ValueRepr::Map(ref items, _) => items.get(&KeyRef::Str(key)).cloned(),
             ValueRepr::Dynamic(ref dy) => match dy.kind() {
-                ObjectKind::Plain | ObjectKind::Seq(_) => None,
                 ObjectKind::Struct(s) => s.get_field(key),
+                ObjectKind::Plain | ObjectKind::Seq(_) => None,
             },
-            ValueRepr::Undefined => {
-                return Err(Error::from(ErrorKind::UndefinedError));
-            }
             _ => None,
-        };
-        Ok(value.unwrap_or(Value::UNDEFINED))
+        }
+        .unwrap_or(Value::UNDEFINED))
+    }
+
+    /// Alternative lookup strategy without error handling exclusively for context
+    /// resolution.
+    ///
+    /// The main difference is that the return value will be `None` if the value is
+    /// unable to look up the key rather than returning `Undefined` and errors will
+    /// also not be created.
+    pub(crate) fn get_attr_fast(&self, key: &str) -> Option<Value> {
+        match self.0 {
+            ValueRepr::Map(ref items, _) => items.get(&KeyRef::Str(key)).cloned(),
+            ValueRepr::Dynamic(ref dy) => match dy.kind() {
+                ObjectKind::Struct(s) => s.get_field(key),
+                ObjectKind::Plain | ObjectKind::Seq(_) => None,
+            },
+            _ => None,
+        }
     }
 
     /// Looks up an index of the value.
@@ -797,8 +960,9 @@ impl Value {
 
     /// Returns some reference to the boxed object if it is of type `T`, or None if it isn’t.
     ///
-    /// This is basically the "reverse" of [`from_object`](Self::from_object).  It's also
-    /// a shortcut for [`downcast_ref`](trait.Object.html#method.downcast_ref)
+    /// This is basically the "reverse" of [`from_object`](Self::from_object),
+    /// [`from_seq_object`](Self::from_seq_object) and [`from_struct_object`](Self::from_struct_object).
+    /// It's also a shortcut for [`downcast_ref`](trait.Object.html#method.downcast_ref)
     /// on the return value of [`as_object`](Self::as_object).
     ///
     /// # Example
@@ -824,12 +988,35 @@ impl Value {
     /// let thing = x_value.downcast_object_ref::<Thing>().unwrap();
     /// assert_eq!(thing.id, 42);
     /// ```
-    pub fn downcast_object_ref<T: Object>(&self) -> Option<&T> {
+    ///
+    /// It also works with [`SeqObject`] or [`StructObject`]:
+    ///
+    /// ```rust
+    /// # use minijinja::value::{Value, SeqObject};
+    ///
+    /// struct Thing {
+    ///     id: usize,
+    /// }
+    ///
+    /// impl SeqObject for Thing {
+    ///     fn get_item(&self, idx: usize) -> Option<Value> {
+    ///         (idx < 3).then(|| Value::from(idx))
+    ///     }
+    ///     fn item_count(&self) -> usize {
+    ///         3
+    ///     }
+    /// }
+    ///
+    /// let x_value = Value::from_seq_object(Thing { id: 42 });
+    /// let thing = x_value.downcast_object_ref::<Thing>().unwrap();
+    /// assert_eq!(thing.id, 42);
+    /// ```
+    pub fn downcast_object_ref<T: 'static>(&self) -> Option<&T> {
         self.as_object().and_then(|x| x.downcast_ref())
     }
 
-    fn get_item_opt(&self, key: &Value) -> Option<Value> {
-        let key = some!(Key::from_borrowed_value(key).ok());
+    pub(crate) fn get_item_opt(&self, key: &Value) -> Option<Value> {
+        let key = KeyRef::Value(key.clone());
 
         let seq = match self.0 {
             ValueRepr::Map(ref items, _) => return items.get(&key).cloned(),
@@ -837,16 +1024,31 @@ impl Value {
             ValueRepr::Dynamic(ref dy) => match dy.kind() {
                 ObjectKind::Plain => return None,
                 ObjectKind::Seq(s) => s,
-                ObjectKind::Struct(s) => match key {
-                    Key::String(ref key) => return s.get_field(key),
-                    Key::Str(key) => return s.get_field(key),
-                    _ => return None,
-                },
+                ObjectKind::Struct(s) => {
+                    return if let Some(key) = key.as_str() {
+                        s.get_field(key)
+                    } else {
+                        None
+                    };
+                }
             },
+            ValueRepr::String(ref s, _) => {
+                if let Some(idx) = key.as_i64() {
+                    let idx = some!(isize::try_from(idx).ok());
+                    let idx = if idx < 0 {
+                        some!(s.chars().count().checked_sub(-idx as usize))
+                    } else {
+                        idx as usize
+                    };
+                    return s.chars().nth(idx).map(Value::from);
+                } else {
+                    return None;
+                }
+            }
             _ => return None,
         };
 
-        if let Key::I64(idx) = key {
+        if let Some(idx) = key.as_i64() {
             let idx = some!(isize::try_from(idx).ok());
             let idx = if idx < 0 {
                 some!(seq.item_count().checked_sub(-idx as usize))
@@ -860,7 +1062,54 @@ impl Value {
     }
 
     /// Calls the value directly.
-    pub(crate) fn call(&self, state: &State, args: &[Value]) -> Result<Value, Error> {
+    ///
+    /// If the value holds a function or macro, this invokes it.  Note that in
+    /// MiniJinja there is a separate namespace for methods on objects and callable
+    /// items.  To call methods (which should be a rather rare occurrence) you
+    /// have to use [`call_method`](Self::call_method).
+    ///
+    /// The `args` slice is for the arguments of the function call.  To pass
+    /// keyword arguments use the [`Kwargs`] type.
+    ///
+    /// Usually the state is already available when it's useful to call this method,
+    /// but when it's not available you can get a fresh template state straight
+    /// from the [`Template`](crate::Template) via [`new_state`](crate::Template::new_state).
+    ///
+    /// ```
+    /// # use minijinja::{Environment, value::{Value, Kwargs}};
+    /// # let mut env = Environment::new();
+    /// # env.add_template("foo", "").unwrap();
+    /// # let tmpl = env.get_template("foo").unwrap();
+    /// # let state = tmpl.new_state(); let state = &state;
+    /// let func = Value::from_function(|v: i64, kwargs: Kwargs| {
+    ///     v * kwargs.get::<i64>("mult").unwrap_or(1)
+    /// });
+    /// let rv = func.call(
+    ///     state,
+    ///     &[
+    ///         Value::from(42),
+    ///         Value::from(Kwargs::from_iter([("mult", Value::from(2))])),
+    ///     ],
+    /// ).unwrap();
+    /// assert_eq!(rv, Value::from(84));
+    /// ```
+    ///
+    /// With the [`args!`](crate::args) macro creating an argument slice is
+    /// simplified:
+    ///
+    /// ```
+    /// # use minijinja::{Environment, args, value::{Value, Kwargs}};
+    /// # let mut env = Environment::new();
+    /// # env.add_template("foo", "").unwrap();
+    /// # let tmpl = env.get_template("foo").unwrap();
+    /// # let state = tmpl.new_state(); let state = &state;
+    /// let func = Value::from_function(|v: i64, kwargs: Kwargs| {
+    ///     v * kwargs.get::<i64>("mult").unwrap_or(1)
+    /// });
+    /// let rv = func.call(state, args!(42, mult => 2)).unwrap();
+    /// assert_eq!(rv, Value::from(84));
+    /// ```
+    pub fn call(&self, state: &State, args: &[Value]) -> Result<Value, Error> {
         if let ValueRepr::Dynamic(ref dy) = self.0 {
             dy.call(state, args)
         } else {
@@ -871,26 +1120,15 @@ impl Value {
         }
     }
 
-    /// Like `as_str` but always stringifies the value.
-    #[allow(unused)]
-    pub(crate) fn to_cowstr(&self) -> Cow<'_, str> {
-        match &self.0 {
-            ValueRepr::String(ref s, _) => Cow::Borrowed(s.as_str()),
-            _ => Cow::Owned(self.to_string()),
-        }
-    }
-
     /// Calls a method on the value.
-    pub(crate) fn call_method(
-        &self,
-        state: &State,
-        name: &str,
-        args: &[Value],
-    ) -> Result<Value, Error> {
+    ///
+    /// The name of the method is `name`, the arguments passed are in the `args`
+    /// slice.
+    pub fn call_method(&self, state: &State, name: &str, args: &[Value]) -> Result<Value, Error> {
         match self.0 {
             ValueRepr::Dynamic(ref dy) => return dy.call_method(state, name, args),
             ValueRepr::Map(ref map, _) => {
-                if let Some(value) = map.get(&Key::Str(name)) {
+                if let Some(value) = map.get(&KeyRef::Str(name)) {
                     return value.call(state, args);
                 }
             }
@@ -900,25 +1138,6 @@ impl Value {
             ErrorKind::InvalidOperation,
             format!("object has no method named {name}"),
         ))
-    }
-
-    pub(crate) fn try_into_key(self) -> Result<StaticKey, Error> {
-        match self.0 {
-            ValueRepr::Bool(val) => Ok(Key::Bool(val)),
-            ValueRepr::U64(v) => TryFrom::try_from(v)
-                .map(Key::I64)
-                .map_err(|_| ErrorKind::NonKey.into()),
-            ValueRepr::U128(v) => TryFrom::try_from(v.0)
-                .map(Key::I64)
-                .map_err(|_| ErrorKind::NonKey.into()),
-            ValueRepr::I64(v) => Ok(Key::I64(v)),
-            ValueRepr::I128(v) => TryFrom::try_from(v.0)
-                .map(Key::I64)
-                .map_err(|_| ErrorKind::NonKey.into()),
-            ValueRepr::Char(c) => Ok(Key::Char(c)),
-            ValueRepr::String(ref s, _) => Ok(Key::String(s.clone())),
-            _ => Err(ErrorKind::NonKey.into()),
-        }
     }
 
     /// Iterates over the value without holding a reference.
@@ -995,12 +1214,21 @@ impl serde::Serialize for Value {
     {
         // enable round tripping of values
         if serializing_for_value() {
-            use serde::ser::SerializeStruct;
-            let handle = LAST_VALUE_HANDLE.with(|x| x.fetch_add(1, atomic::Ordering::Relaxed));
+            let handle = LAST_VALUE_HANDLE.with(|x| {
+                // we are okay with overflowing the handle here because these values only
+                // live for a very short period of time and it's not likely that you run out
+                // of an entire u32 worth of handles in a single serialization operation.
+                // This lets us stick the handle into a unit variant in the serde data model.
+                let rv = x.get().wrapping_add(1);
+                x.set(rv);
+                rv
+            });
             VALUE_HANDLES.with(|handles| handles.borrow_mut().insert(handle, self.clone()));
-            let mut s = ok!(serializer.serialize_struct(VALUE_HANDLE_MARKER, 1));
-            ok!(s.serialize_field("handle", &handle));
-            return s.end();
+            return serializer.serialize_unit_variant(
+                VALUE_HANDLE_MARKER,
+                handle,
+                VALUE_HANDLE_MARKER,
+            );
         }
 
         match self.0 {
@@ -1008,8 +1236,9 @@ impl serde::Serialize for Value {
             ValueRepr::U64(u) => serializer.serialize_u64(u),
             ValueRepr::I64(i) => serializer.serialize_i64(i),
             ValueRepr::F64(f) => serializer.serialize_f64(f),
-            ValueRepr::Char(c) => serializer.serialize_char(c),
-            ValueRepr::None | ValueRepr::Undefined => serializer.serialize_unit(),
+            ValueRepr::None | ValueRepr::Undefined | ValueRepr::Invalid(_) => {
+                serializer.serialize_unit()
+            }
             ValueRepr::U128(u) => serializer.serialize_u128(u.0),
             ValueRepr::I128(i) => serializer.serialize_i128(i.0),
             ValueRepr::String(ref s, _) => serializer.serialize_str(s),
@@ -1044,7 +1273,7 @@ impl serde::Serialize for Value {
                     } else {
                         for k in s.fields() {
                             let v = s.get_field(&k).unwrap_or(Value::UNDEFINED);
-                            ok!(map.serialize_entry(k.as_str(), &v));
+                            ok!(map.serialize_entry(&*k as &str, &v));
                         }
                     }
                     map.end()
@@ -1099,13 +1328,13 @@ impl fmt::Debug for OwnedValueIterator {
 
 enum ValueIteratorState {
     Empty,
-    Chars(usize, Arc<String>),
+    Chars(usize, Arc<str>),
     Seq(usize, Arc<Vec<Value>>),
     StaticStr(usize, &'static [&'static str]),
-    ArcStr(usize, Vec<Arc<String>>),
+    ArcStr(usize, Vec<Arc<str>>),
     DynSeq(usize, Arc<dyn Object>),
     #[cfg(not(feature = "preserve_order"))]
-    Map(Option<StaticKey>, Arc<ValueMap>),
+    Map(Option<KeyRef<'static>>, Arc<ValueMap>),
     #[cfg(feature = "preserve_order")]
     Map(usize, Arc<ValueMap>),
 }
@@ -1115,7 +1344,7 @@ impl ValueIteratorState {
         match self {
             ValueIteratorState::Empty => None,
             ValueIteratorState::Chars(offset, ref s) => {
-                s.as_str()[*offset..].chars().next().map(|c| {
+                (s as &str)[*offset..].chars().next().map(|c| {
                     *offset += c.len_utf8();
                     Value::from(c)
                 })
@@ -1148,13 +1377,13 @@ impl ValueIteratorState {
             #[cfg(feature = "preserve_order")]
             ValueIteratorState::Map(idx, map) => map.get_index(*idx).map(|x| {
                 *idx += 1;
-                Value::from(x.0.clone())
+                x.0.as_value()
             }),
             #[cfg(not(feature = "preserve_order"))]
             ValueIteratorState::Map(ptr, map) => {
                 if let Some(current) = ptr.take() {
                     let next = map.range(&current..).nth(1).map(|x| x.0.clone());
-                    let rv = Value::from(current);
+                    let rv = current.as_value();
                     *ptr = next;
                     Some(rv)
                 } else {
@@ -1165,50 +1394,67 @@ impl ValueIteratorState {
     }
 }
 
-#[test]
-fn test_dynamic_object_roundtrip() {
-    use std::sync::atomic::AtomicUsize;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    #[derive(Debug)]
-    struct X(AtomicUsize);
+    use similar_asserts::assert_eq;
 
-    impl fmt::Display for X {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "{}", self.0.load(atomic::Ordering::Relaxed))
-        }
-    }
+    #[test]
+    fn test_dynamic_object_roundtrip() {
+        use std::sync::atomic::{self, AtomicUsize};
 
-    impl Object for X {
-        fn kind(&self) -> ObjectKind<'_> {
-            ObjectKind::Struct(self)
-        }
-    }
+        #[derive(Debug)]
+        struct X(AtomicUsize);
 
-    impl crate::value::object::StructObject for X {
-        fn get_field(&self, name: &str) -> Option<Value> {
-            match name {
-                "value" => Some(Value::from(self.0.load(atomic::Ordering::Relaxed))),
-                _ => None,
+        impl fmt::Display for X {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}", self.0.load(atomic::Ordering::Relaxed))
             }
         }
 
-        fn static_fields(&self) -> Option<&'static [&'static str]> {
-            Some(&["value"][..])
+        impl Object for X {
+            fn kind(&self) -> ObjectKind<'_> {
+                ObjectKind::Struct(self)
+            }
         }
+
+        impl crate::value::object::StructObject for X {
+            fn get_field(&self, name: &str) -> Option<Value> {
+                match name {
+                    "value" => Some(Value::from(self.0.load(atomic::Ordering::Relaxed))),
+                    _ => None,
+                }
+            }
+
+            fn static_fields(&self) -> Option<&'static [&'static str]> {
+                Some(&["value"][..])
+            }
+        }
+
+        let x = Arc::new(X(Default::default()));
+        let x_value = Value::from(x.clone());
+        x.0.fetch_add(42, atomic::Ordering::Relaxed);
+        let x_clone = Value::from_serializable(&x_value);
+        x.0.fetch_add(23, atomic::Ordering::Relaxed);
+
+        assert_eq!(x_value.to_string(), "65");
+        assert_eq!(x_clone.to_string(), "65");
     }
 
-    let x = Arc::new(X(Default::default()));
-    let x_value = Value::from(x.clone());
-    x.0.fetch_add(42, atomic::Ordering::Relaxed);
-    let x_clone = Value::from_serializable(&x_value);
-    x.0.fetch_add(23, atomic::Ordering::Relaxed);
+    #[test]
+    fn test_string_char() {
+        let val = Value::from('a');
+        assert_eq!(char::try_from(val).unwrap(), 'a');
+        let val = Value::from("a");
+        assert_eq!(char::try_from(val).unwrap(), 'a');
+        let val = Value::from("wat");
+        assert!(char::try_from(val).is_err());
+    }
 
-    assert_eq!(x_value.to_string(), "65");
-    assert_eq!(x_clone.to_string(), "65");
-}
-
-#[test]
-#[cfg(target_pointer_width = "64")]
-fn test_sizes() {
-    assert_eq!(std::mem::size_of::<Value>(), 24);
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn test_sizes() {
+        assert_eq!(std::mem::size_of::<Value>(), 24);
+    }
 }

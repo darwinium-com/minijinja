@@ -27,8 +27,18 @@ class Environment(_lowlevel.Environment):
         globals=None,
         debug=True,
         fuel=None,
+        undefined_behavior=None,
         auto_escape_callback=None,
+        path_join_callback=None,
+        keep_trailing_newline=False,
+        finalizer=None,
         reload_before_render=False,
+        block_start_string="{%",
+        block_end_string="%}",
+        variable_start_string="{{",
+        variable_end_string="}}",
+        comment_start_string="{#",
+        comment_end_string="#}",
     ):
         super().__init__()
         if loader is not None:
@@ -51,7 +61,24 @@ class Environment(_lowlevel.Environment):
         self.debug = debug
         if auto_escape_callback is not None:
             self.auto_escape_callback = auto_escape_callback
+        if path_join_callback is not None:
+            self.path_join_callback = path_join_callback
+        if keep_trailing_newline:
+            self.keep_trailing_newline = True
+        if finalizer is not None:
+            self.finalizer = finalizer
+        if undefined_behavior is not None:
+            self.undefined_behavior = undefined_behavior
         self.reload_before_render = reload_before_render
+
+        # XXX: because this is not an atomic reconfigure if you set one of
+        # the values to a conflicting set, it will immediately error out :(
+        self.block_start_string = block_start_string
+        self.block_end_string = block_end_string
+        self.variable_start_string = variable_start_string
+        self.variable_end_string = variable_end_string
+        self.comment_start_string = comment_start_string
+        self.comment_end_string = comment_end_string
 
 
 DEFAULT_ENVIRONMENT = Environment()
@@ -121,10 +148,28 @@ class TemplateError(RuntimeError):
             return self._info.name
 
     @property
+    def detail(self):
+        """The detail error message of the error."""
+        if self._info is not None:
+            return self._info.detail
+
+    @property
     def line(self):
         """The line of the error."""
         if self._info is not None:
             return self._info.line
+
+    @property
+    def range(self):
+        """The range of the error."""
+        if self._info is not None:
+            return self._info.range
+
+    @property
+    def template_source(self):
+        """The template source of the error."""
+        if self._info is not None:
+            return self._info.template_source
 
     def __str__(self):
         if self._info is not None:

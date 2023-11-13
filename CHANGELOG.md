@@ -2,6 +2,398 @@
 
 All notable changes to MiniJinja are documented here.
 
+## 1.0.10
+
+- Added `int` and `float` filters.  #372
+- Added `integer` and `float` tests.  #373
+- Fixed an issue that caused the CLI not to run when the `repl` feature
+  was disabled.  #374
+- Added `-n` / `--no-newline` option to CLI.  #375
+
+## 1.0.9
+
+- Fixed a memory leak involving macros.  Previously using macros was
+  leaking memory due to an undetected cycle.  #359
+- The `debug` function in templates can now also be used to print out
+  the debug output of a variable.  #356
+- Added a new `stacker` feature which allows raising of the recursion
+  limits.  It enables monitoring of the call stack via [stacker](https://crates.io/crates/stacker)
+  and automatically acquires additional memory when the call stack
+  runs out of space.  #354
+
+## 1.0.8
+
+- Large integer literals in templates are now correctly handled.  #353
+- Relax the trait bounds of `Value::downcast_object_ref` /
+  `Object::downcast_ref` / `Object::is` and added support for downcasting
+  of types that were directly created with `Value::from_seq_object`
+  and `Value::from_struct_object`.  #349
+- Overflowing additions on very large integers now fails rather than
+  silently wrapping around.  #350
+- Fixed a few overflow panics: dividing integers with an overflow and
+- Exposed missing new functionality for the Python binding. #339
+
+## 1.0.7
+
+- Added support for `keep_trailing_newlines` which allows you to disable
+  the automatic trimming of trailing newlines.  #334
+- Added `minijinja-cli` which lets you render and debug templates from
+  the command line.  #331
+- Macros called with the wrong state will no longer panic.  #330
+- Debug output of `Value::UNDEFINED` and `Value::from(())` is now
+  `undefined` and `none` rather than `Undefined` and `None`.  This was
+  an accidental inconsistency.
+- Fixed a potential panic in debug error printing.
+- Added `Environment::set_path_join_callback` and `State::get_template`
+  to support path joining.  This is for greater compatibility with Jinja2
+  where path joining was overridable.  With this you can configure the
+  engine so that paths used by `include` or `extends` can be relative to
+  the current template.  #328
+- The default auto-escape detection now accepts `.html.j2` as alias for
+  `.html` as well as for all other choices.  In general `.j2` as an extension
+  is now generally supported.
+
+## 1.0.6
+
+- Fixed iso datetime formatting not handling negative offsets correctly.  #327
+- Re-report `Value` directly from the crate root for convenience.
+- It's now possible to `deserialize` from a `Value`.  Additionally the
+  `ViaDeserialize<T>` argument type was added to support value conversions
+  via serde as argument type.  #325
+
+## 1.0.5
+
+- Added the ability to merge multiple values with the `context!`
+  macro.  (#317)
+- `Option<T>` now accepts `none` in filters.  Previously only
+  undefined values were accepted.  This bugfix might have a minor impact
+  on code that relied in this behavior.  (#320)
+- Fix a compilation error for `minijinja-contrib` if the `timezone`
+  feature is not enabled.
+
+## 1.0.4
+
+- Added the `args!` macro which can be used to create an argument
+  slice on the stack.  (#311)
+- Improved error reporting for missing keyword arguments.
+- Added `chrono` support to the time filters in the `minijinja-contrib` crate.
+
+## 1.0.3
+
+- Republished `1.0.2` with fixed docs.
+
+## 1.0.2
+
+- Added `TryFrom` and `ArgType` for `Arc<str>`.
+- Added `datetimeformat`, `dateformat`, `timeformat` and `now()` to the
+  contrib crate.  (#309)
+
+## 1.0.1
+
+- Fixed a bug that caused `{% raw %}` blocks to accidentally not skip the
+  surrounding tags, causing `{% raw %}` and `{% endraw %}` to show up in
+  output.  (#307)
+
+## 1.0.0
+
+- Support unicode sorting for filters when the `unicode` feature is enabled.
+  This also fixes confusing behavior when mixed types were sorted.  (#299)
+
+- Added `json5` as file extension for JSON formatter.
+
+- The autoreload crate now supports fast reloading by just clearning the
+  already templates.  This is enabled via `set_fast_reload` on the
+  `Notifier`.
+
+**Note:** This also includes all the changes in the different 1.0.0 alphas.
+
+### Breaking Changes
+
+1.0 includes a lot of changes that are breaking.  However they should with
+some minor exceptions be rather trivial changes.
+
+- `Environment::source`, `Environment::set_source` and the `Source` type
+  together with the `source` feature were removed.  The replacement is the
+  new `loader` feature which adds the `add_template_owned` and `set_loader`
+  APIs.  The functionality previously provided by `Source::from_path` is
+  now available via `path_loader`.
+
+    Old:
+
+    ```rust
+    let mut source = Source::with_loader(|name| ...);
+    source.add_template("foo", "...").unwrap();
+    let mut env = Environment::new();
+    env.set_source(source);
+    ```
+
+    New:
+
+    ```rust
+    let mut env = Environment::new();
+    env.set_loader(|name| ...);
+    env.add_template_owned("foo", "...").unwrap();
+    ```
+
+    Old:
+
+    ```rust
+    let mut env = Environment::new();
+    env.set_source(Source::from_path("templates"));
+    ```
+
+    New:
+
+    ```rust
+    let mut env = Environment::new();
+    env.set_loader(path_loader("templates"));
+    ```
+
+- `Template::render_block` and `Template::render_block_to_write` were
+  replaced with APIs of the same name on the `State` returned by
+  `Template::eval_to_state` or `Template::render_and_return_state`:
+
+    Old:
+
+    ```rust
+    let rv = tmpl.render_block("name", ctx)?;
+    ```
+
+    New:
+
+    ```rust
+    let rv = tmpl.eval_to_state(ctx)?.render_block("name")?;
+    ```
+
+- `Kwargs::from_args` was removed as API as it's no longer necessary since
+  the `from_args` function now provides the same functionality:
+
+    Before:
+
+    ```rust
+    // just split
+    let (args, kwargs) = Kwargs::from_args(values);
+
+    // split and parse
+    let (args, kwargs) = Kwargs::from_args(values);
+    let (a, b): (i32, i32) = from_args(args)?;
+    ```
+
+    After:
+
+    ```rust
+    // just split
+    let (args, kwargs): (&[Value], Kwargs) = from_args(values)?;
+
+    // split and parse
+    let (a, b, kwargs): (i32, i32, Kwargs) = from_args(values)?;
+    ```
+
+- The `testutils` feature and `testutils` module were removed.  Instead you
+  can now directly create an empty `State` and use the methods provided
+  to invoke filters.
+
+    Before:
+
+    ```rust
+    let env = Environment::new();
+    let rv = apply_filter(&env, "upper", &["hello world".into()]).unwrap();
+    ```
+
+    After:
+
+    ```rust
+    let env = Environment::new();
+    let rv = env.empty_state().apply_filter("upper", &["hello world".into()]).unwrap();
+    ```
+
+    Before:
+
+    ```rust
+    let env = Environment::new();
+    let rv = perform_test(&env, "even", &[42.into()]).unwrap();
+    ```
+
+    After:
+
+    ```rust
+    let env = Environment::new();
+    let rv = env.empty_state().perform_test("even", &[42.into()]).unwrap();
+    ```
+
+    Before:
+
+    ```rust
+    let env = Environment::new();
+    let rv = format(&env, 42.into()).unwrap();
+    ```
+
+    After:
+
+    ```rust
+    let env = Environment::new();
+    let rv = env.empty_state().format(42.into()).unwrap();
+    ```
+
+- `intern` and some APIs that use `Arc<String>` now use `Arc<str>`.  This
+  means that for instance `StructObject::fields` returns `Arc<str>` instead
+  of `Arc<String>`.  All the type conversions that previously accepted
+  `Arc<String>` now only support `Arc<str>`.
+
+- `State::current_call` was removed without replacement.  This information
+  was unreliably maintained in the engine and caused issues with recursive
+  calls.  If you have a need for this API please reach out on the issue
+  tracker.
+
+- `Output::is_discarding` was removed without replacement.  This is
+  an implementation detail and was unintentionally exposed.  You should not
+  write code that depends on the internal state of the `Output`.
+
+## 1.0.0-alpha.4
+
+- `Value` now implements `Ord`.  This also improves the ability of the engine
+  to sort more complex values in filters.  (#295)
+
+- `Arc<String>` was replaced with `Arc<str>` in some of the public APIs where
+  this shined through.  Support for more complex key types in maps was added.
+  You can now have tuple keys for instance.  (#297)
+
+## 1.0.0-alpha.3
+
+- Removed `char` as a value type.  Characters are now represented as strings
+  instead.  This solves a bunch of Jinja2 incompatibilities that resulted by
+  indexing into strings.  (#292)
+
+- Marked `ErrorKind` as `#[non_exhaustive]`.
+
+- Correctly handle coercing of characters and strings.  `"w" == "w"[0]` is
+  now evaluating to `true` as one would expect.
+
+## 1.0.0-alpha.2
+
+- The `include` block now supports `with context` and `without context`
+  modifiers but they are ignored.  This is mostly helpful to render some
+  Jinja2 templates that depend on this functionality.  (#288)
+
+- Added tests `true`, `false`, `filter`, `test` and filters
+  `pprint` and `unique`.  (#287)
+
+- Added support for indexing into strings.  (#149)
+
+- Added `Error::detail` which returns the detail help string.  (#289)
+
+- Added `Error::template_source` and `Error::range` to better support
+  rendering of errors outside of the built-in debug printing.  (#286)
+
+## 1.0.0-alpha.1
+
+- Removed `testutils` feature.  New replacement APIs are directly available
+  on the `State`.
+
+- Added `Template::render_and_return_state` to render a template and return the
+  resulting `State` to permit introspection.  `Template::render_to_write` now
+  also returns the `State`.
+
+- Added `State::fuel_levels` to introspect fuel consumption when the fuel feature
+  is in use.
+
+- Removed `Source` and the `source` feature.  The replacement is the new `loader`
+  feature and the functionality of the source is moved directly into the
+  `Environment`.  This also adds `Environment::clear_templates` to unload
+  all already loaded templates.  (#275)
+
+- Added `Environment::template_from_str` and `Environment::template_from_named_str`
+  to compile templates for temporary use.  (#274)
+
+- Removed `Kwargs::from_args` as this can now be expressed with just
+  `from_args`.  (#273)
+
+- `Output` no longer reveals if it's discarding in the public API.
+
+- Added `Value::call`, `Value::call_method` and `Template::new_state`.  The
+  combination of these APIs makes it possible to call values which was
+  previously not possible.  (#272)
+
+- Added `Template::eval_to_state`.  This replaces the functionality of the
+  previous `Template::render_block` which is now available via `State`.
+  It also adds support for accessing globals and macros from a template
+  via the `State`.  (#271)
+
+- Removed support for `State::current_call`.  This property wasn't too useful
+  and unreliable.  Supporting it properly for nested invocations would require
+  calls to take a mutable state or use interior mutability which did not seem
+  reasonable for this.  (#269)
+
+## 0.34.0
+
+- Updated `self_cell` and `percent-encoding` dependencies.  (#264)
+
+- Added `Template::render_block` and `Template::render_block_to_write` which
+  allows rendering a single block in isolation.  (#262)
+
+## 0.33.0
+
+- Hide accidentally exposed `Syntax::compile` method.
+- Added `undeclared_variables` methods to `Template` and `Expression`. (#250)
+
+## 0.32.1
+
+- Fixed an issue with autoreload not working properly on windows. (#249)
+
+## 0.32.0
+
+- Added `Value::is_number`. (#240)
+- `TryFrom` for `Value` now converts integers to `f32` and `f64`.
+- Added the new `custom_syntax` feature which allows custom delimiters
+  to be configured. (#245)
+- Added `Kwargs` abstraction to easier handle keyword arguments.
+- Fixed an issue that `Option<T>` was incorrectly picking up `none`
+  for undefined values.
+- The `sort` filter now accepts `reverse`, `attribute` and `case_sensitive`
+  by keyword argument and sorts case insensitive by default.
+- The `dictsort` filter now supports reversing, by value sorting,
+  and is sorting case insensitive by default.
+
+## 0.31.1
+
+- The `in` operator now does not fail if the value is undefined and the
+  undefined behavior is not strict. (#235)
+- The Python binding now supports finalizers. (#238)
+
+## 0.31.0
+
+- Changed the closure behavior of macros to match the one of Jinja2. (#233)
+- `Value::from_serializable` will no longer panic on invalid values.  Instead
+  the error is deferred to runtime which makes working with objects possible
+  that are only partially valid for the runtime environment. (#234)
+
+## 0.30.7
+
+- Added `testutils` module. (#221)
+- Make it more obvious that serde flatten sometimes does not work. (#223)
+- Added configurable "undefined" value behavior. (#227)
+- Make `render!()` reuse the hidden environment.
+
+## 0.30.6
+
+- Resolve bad closure being generated for `do` blocks. (#219)
+- Add support for float number values in scientific notation. (#220)
+
+## 0.30.5
+
+- Small performance improvements for when `preserve_order` is used by
+  passing known capacities to the constructor.
+- Minor performance improvements to the VM by giving the stack an initial
+  capacity.
+- Change the internal representation of spans to use `u32` rather than
+  `usize` for line and column offsets as a small speed improvement during
+  compilation.
+- Performance improvements for the key interning.
+- Disabled `key_interning` by default.
+- Renamed features `multi-template` to `multi_template` and
+  `adjacent-loop-items` to `adjacent_loop_items`. The old feature names will
+  hang around until 1.x as legacy aliases.
+
 ## 0.30.4
 
 - Restore compilation on 32bit targets. (#207)
@@ -116,11 +508,11 @@ All notable changes to MiniJinja are documented here.
 - Performance improvements.
 - Added support for `{% import %}` / `{% from .. import .. %}`
   and `{% macro %}`.  (#123)
-- Added `Value::is_kwargs` which disambiugates if an object passed
+- Added `Value::is_kwargs` which disambiguates if an object passed
   to a function or filter is a normal object or if it represents
   keyword arguments.
 - Added the ability to call functions stored on objects.
-- Added `macros` and `multi-template` features to disable some of
+- Added `macros` and `multi_template` features to disable some of
   the heavier pieces of MiniJinja.
 - Fixed an issue that caused trailing commas not to work in lists.
 
@@ -144,7 +536,7 @@ All notable changes to MiniJinja are documented here.
 - Added custom formatters.
 - Restructured engine internals for greater clarity.
 - Added support for rendering to `io::Write`.  (#111)
-- Make it impossible to implement `Fitler`, `Test` or `Function`
+- Make it impossible to implement `Filter`, `Test` or `Function`
   from outside the crate by sealed the traits.  (#113)
 - Added support for remaining arguments with `Rest`.  (#114)
 - Filters, tests and functions can now borrow arguments.  (#115)
@@ -198,7 +590,7 @@ All notable changes to MiniJinja are documented here.
 - Add missing escape support for single quotes (`'`).  (#81) 
 - Added support for newlines in string literals.  (#85)
 - Added support for block assignment syntax.  (#86)
-- Added string concatenatino with `+` for Jinja compat.  (#87)
+- Added string concatenation with `+` for Jinja compat.  (#87)
 - Enable debug mode by default in debug builds.  (#88)
 - Added `render!` macro and `render_str`.  (#89)
 - Fixed an issue where trailing whitespace removal did not work on blocks.  (#90)

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,20 +9,22 @@ use crate::compiler::instructions::{
 use crate::environment::Environment;
 use crate::error::{Error, ErrorKind};
 use crate::output::{CaptureMode, Output};
-use crate::utils::AutoEscape;
-use crate::value::{self, ops, MapType, Value, ValueMap, ValueRepr};
-use crate::vm::context::{Context, Frame, LoopState, Stack};
+use crate::utils::{untrusted_size_hint, AutoEscape, UndefinedBehavior};
+use crate::value::{
+    ops, value_map_with_capacity, value_optimization, KeyRef, MapType, Value, ValueRepr,
+};
+use crate::vm::context::{Frame, LoopState, Stack};
 use crate::vm::loop_object::Loop;
 use crate::vm::state::BlockStack;
 
 #[cfg(feature = "macros")]
-use crate::vm::macro_object::{Macro, MacroData};
+use crate::vm::{closure_object::Closure, macro_object::Macro};
 
-#[cfg(feature = "fuel")]
-use crate::vm::fuel::FuelTracker;
-
+pub(crate) use crate::vm::context::Context;
 pub use crate::vm::state::State;
 
+#[cfg(feature = "macros")]
+mod closure_object;
 mod context;
 #[cfg(feature = "fuel")]
 mod fuel;
@@ -32,7 +34,7 @@ mod macro_object;
 mod state;
 
 // the cost of a single include against the stack limit.
-#[cfg(feature = "multi-template")]
+#[cfg(feature = "multi_template")]
 const INCLUDE_RECURSION_COST: usize = 10;
 
 // the cost of a single macro call against the stack limit.
@@ -45,9 +47,9 @@ pub struct Vm<'env> {
     env: &'env Environment<'env>,
 }
 
-fn prepare_blocks<'env, 'vm>(
-    blocks: &'vm BTreeMap<&'env str, Instructions<'env>>,
-) -> BTreeMap<&'env str, BlockStack<'vm, 'env>> {
+pub(crate) fn prepare_blocks<'env, 'template>(
+    blocks: &'template BTreeMap<&'env str, Instructions<'env>>,
+) -> BTreeMap<&'env str, BlockStack<'template, 'env>> {
     blocks
         .iter()
         .map(|(name, instr)| (*name, BlockStack::new(instr)))
@@ -76,70 +78,69 @@ impl<'env> Vm<'env> {
         Vm { env }
     }
 
-    /// Evaluates the given inputs
-    pub fn eval(
+    /// Evaluates the given inputs.
+    ///
+    /// It returns both the last value left on the stack as well as the state
+    /// at the end of the evaluation.
+    pub fn eval<'template>(
         &self,
-        instructions: &Instructions<'env>,
+        instructions: &'template Instructions<'env>,
         root: Value,
-        blocks: &BTreeMap<&'env str, Instructions<'env>>,
+        blocks: &'template BTreeMap<&'env str, Instructions<'env>>,
         out: &mut Output,
         auto_escape: AutoEscape,
-    ) -> Result<Option<Value>, Error> {
-        value::with_value_optimization(|| {
-            self.eval_state(
-                &mut State {
-                    env: self.env,
-                    ctx: Context::new(Frame::new(root)),
-                    current_block: None,
-                    current_call: None,
-                    auto_escape,
-                    instructions,
-                    blocks: prepare_blocks(blocks),
-                    loaded_templates: BTreeSet::new(),
-                    #[cfg(feature = "macros")]
-                    macros: Arc::new(Vec::new()),
-                    #[cfg(feature = "fuel")]
-                    fuel_tracker: self.env.fuel().map(FuelTracker::new),
-                },
-                out,
-            )
-        })
+    ) -> Result<(Option<Value>, State<'template, 'env>), Error> {
+        let _guard = value_optimization();
+        let mut state = State::new(
+            self.env,
+            Context::new_with_frame(ok!(Frame::new_checked(root)), self.env.recursion_limit()),
+            auto_escape,
+            instructions,
+            prepare_blocks(blocks),
+        );
+        self.eval_state(&mut state, out).map(|x| (x, state))
     }
 
     /// Evaluate a macro in a state.
     #[cfg(feature = "macros")]
+    #[allow(clippy::too_many_arguments)]
     pub fn eval_macro(
         &self,
         instructions: &Instructions<'env>,
         pc: usize,
-        root: Value,
+        closure: Value,
+        caller: Option<Value>,
         out: &mut Output,
         state: &State,
         args: Vec<Value>,
     ) -> Result<Option<Value>, Error> {
-        value::with_value_optimization(|| {
-            let mut ctx = Context::new(Frame::new(root));
-            ok!(ctx.incr_depth(state.ctx.depth() + MACRO_RECURSION_COST));
-            self.eval_impl(
-                &mut State {
-                    env: self.env,
-                    ctx,
-                    current_block: None,
-                    current_call: None,
-                    auto_escape: state.auto_escape(),
-                    instructions,
-                    blocks: BTreeMap::default(),
-                    loaded_templates: BTreeSet::new(),
-                    #[cfg(feature = "macros")]
-                    macros: state.macros.clone(),
-                    #[cfg(feature = "fuel")]
-                    fuel_tracker: state.fuel_tracker.clone(),
-                },
-                out,
-                Stack::from(args),
-                pc,
-            )
-        })
+        let mut ctx = Context::new_with_frame(Frame::new(closure), self.env.recursion_limit());
+        if let Some(caller) = caller {
+            ctx.store("caller", caller);
+        }
+        ok!(ctx.incr_depth(state.ctx.depth() + MACRO_RECURSION_COST));
+        self.do_eval(
+            &mut State {
+                env: self.env,
+                ctx,
+                current_block: None,
+                auto_escape: state.auto_escape(),
+                instructions,
+                blocks: BTreeMap::default(),
+                loaded_templates: Default::default(),
+                #[cfg(feature = "macros")]
+                id: state.id,
+                #[cfg(feature = "macros")]
+                macros: state.macros.clone(),
+                #[cfg(feature = "macros")]
+                closure_tracker: state.closure_tracker.clone(),
+                #[cfg(feature = "fuel")]
+                fuel_tracker: state.fuel_tracker.clone(),
+            },
+            out,
+            Stack::from(args),
+            pc,
+        )
     }
 
     /// This is the actual evaluation loop that works with a specific context.
@@ -149,9 +150,30 @@ impl<'env> Vm<'env> {
         state: &mut State<'_, 'env>,
         out: &mut Output,
     ) -> Result<Option<Value>, Error> {
-        self.eval_impl(state, out, Stack::default(), 0)
+        self.do_eval(state, out, Stack::default(), 0)
     }
 
+    /// Performs the actual evaluation, optionally with stack growth functionality.
+    fn do_eval(
+        &self,
+        state: &mut State<'_, 'env>,
+        out: &mut Output,
+        stack: Stack,
+        pc: usize,
+    ) -> Result<Option<Value>, Error> {
+        #[cfg(feature = "stacker")]
+        {
+            stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
+                self.eval_impl(state, out, stack, pc)
+            })
+        }
+        #[cfg(not(feature = "stacker"))]
+        {
+            self.eval_impl(state, out, stack, pc)
+        }
+    }
+
+    #[inline]
     fn eval_impl(
         &self,
         state: &mut State<'_, 'env>,
@@ -160,6 +182,7 @@ impl<'env> Vm<'env> {
         mut pc: usize,
     ) -> Result<Option<Value>, Error> {
         let initial_auto_escape = state.auto_escape;
+        let undefined_behavior = state.undefined_behavior();
         let mut auto_escape_stack = vec![];
         let mut next_loop_recursion_jump = None;
         let mut loaded_filters = [None; MAX_LOCALS];
@@ -167,8 +190,8 @@ impl<'env> Vm<'env> {
 
         // If we are extending we are holding the instructions of the target parent
         // template here.  This is used to detect multiple extends and the evaluation
-        // uses these instructions when RenderParent is evaluated.
-        #[cfg(feature = "multi-template")]
+        // uses these instructions when it makes it to the end of the instructions.
+        #[cfg(feature = "multi_template")]
         let mut parent_instructions = None;
 
         macro_rules! recurse_loop {
@@ -187,7 +210,30 @@ impl<'env> Vm<'env> {
             }};
         }
 
-        while let Some(instr) = state.instructions.get(pc) {
+        // looks nicer nice way
+        #[allow(clippy::while_let_loop)]
+        loop {
+            let instr = match state.instructions.get(pc) {
+                Some(instr) => instr,
+                #[cfg(not(feature = "multi_template"))]
+                None => break,
+                #[cfg(feature = "multi_template")]
+                None => {
+                    // when an extends statement appears in a template, when we hit the
+                    // last instruction we need to check if parent instructions were
+                    // stashed away (which means we found an extends tag which invoked
+                    // `LoadBlocks`).  If we do find instructions, we reset back to 0
+                    // from the new instructions.
+                    state.instructions = match parent_instructions.take() {
+                        Some(instr) => instr,
+                        None => break,
+                    };
+                    out.end_capture(AutoEscape::None);
+                    pc = 0;
+                    continue;
+                }
+            };
+
             // if we only have two arguments that we pull from the stack, we
             // can assign them to a and b.  This slightly reduces the amount of
             // code bloat generated here.  Do the same for a potential error
@@ -229,6 +275,16 @@ impl<'env> Vm<'env> {
                 };
             }
 
+            macro_rules! assert_valid {
+                ($expr:expr) => {{
+                    let val = $expr;
+                    if let ValueRepr::Invalid(ref err) = val.0 {
+                        bail!(Error::new(ErrorKind::BadSerialization, err.to_string()));
+                    }
+                    val
+                }};
+            }
+
             // if the fuel consumption feature is enabled, track the fuel
             // consumption here.
             #[cfg(feature = "fuel")]
@@ -249,47 +305,63 @@ impl<'env> Vm<'env> {
                     state.ctx.store(name, stack.pop());
                 }
                 Instruction::Lookup(name) => {
-                    stack.push(state.ctx.load(self.env, name).unwrap_or(Value::UNDEFINED));
+                    stack.push(assert_valid!(state
+                        .lookup(name)
+                        .unwrap_or(Value::UNDEFINED)));
                 }
                 Instruction::GetAttr(name) => {
                     a = stack.pop();
-                    stack.push(ctx_ok!(a.get_attr(name)));
+                    // This is a common enough operation that it's interesting to consider a fast
+                    // path here.  This is slightly faster than the regular attr lookup because we
+                    // do not need to pass down the error object for the more common success case.
+                    // Only when we cannot look up something, we start to consider the undefined
+                    // special case.
+                    stack.push(match a.get_attr_fast(name) {
+                        Some(value) => assert_valid!(value),
+                        None => ctx_ok!(undefined_behavior.handle_undefined(a.is_undefined())),
+                    });
                 }
                 Instruction::GetItem => {
                     a = stack.pop();
                     b = stack.pop();
-                    stack.push(ctx_ok!(b.get_item(&a)));
+                    stack.push(match b.get_item_opt(&a) {
+                        Some(value) => assert_valid!(value),
+                        None => ctx_ok!(undefined_behavior.handle_undefined(b.is_undefined())),
+                    });
                 }
                 Instruction::Slice => {
                     let step = stack.pop();
                     let stop = stack.pop();
                     b = stack.pop();
                     a = stack.pop();
+                    if a.is_undefined() && matches!(undefined_behavior, UndefinedBehavior::Strict) {
+                        bail!(Error::from(ErrorKind::UndefinedError));
+                    }
                     stack.push(ctx_ok!(ops::slice(a, b, stop, step)));
                 }
                 Instruction::LoadConst(value) => {
                     stack.push(value.clone());
                 }
                 Instruction::BuildMap(pair_count) => {
-                    let mut map = ValueMap::new();
+                    let mut map = value_map_with_capacity(*pair_count);
                     for _ in 0..*pair_count {
                         let value = stack.pop();
-                        let key = ctx_ok!(stack.pop().try_into_key());
-                        map.insert(key, value);
+                        let key = stack.pop();
+                        map.insert(KeyRef::Value(key), value);
                     }
                     stack.push(Value(ValueRepr::Map(map.into(), MapType::Normal)))
                 }
                 Instruction::BuildKwargs(pair_count) => {
-                    let mut map = ValueMap::new();
+                    let mut map = value_map_with_capacity(*pair_count);
                     for _ in 0..*pair_count {
                         let value = stack.pop();
-                        let key = stack.pop().try_into_key().unwrap();
-                        map.insert(key, value);
+                        let key = stack.pop();
+                        map.insert(KeyRef::Value(key), value);
                     }
                     stack.push(Value(ValueRepr::Map(map.into(), MapType::Kwargs)))
                 }
                 Instruction::BuildList(count) => {
-                    let mut v = Vec::with_capacity(*count);
+                    let mut v = Vec::with_capacity(untrusted_size_hint(*count));
                     for _ in 0..*count {
                         v.push(stack.pop());
                     }
@@ -337,6 +409,9 @@ impl<'env> Vm<'env> {
                 Instruction::In => {
                     a = stack.pop();
                     b = stack.pop();
+                    // the in-operator can fail if the value is undefined and
+                    // we are in strict mode.
+                    ctx_ok!(state.undefined_behavior().assert_iterable(&a));
                     stack.push(ctx_ok!(ops::contains(&a, &b)));
                 }
                 Instruction::Neg => {
@@ -372,7 +447,7 @@ impl<'env> Vm<'env> {
                     l.object.idx.fetch_add(1, Ordering::Relaxed);
 
                     let next = {
-                        #[cfg(feature = "adjacent-loop-items")]
+                        #[cfg(feature = "adjacent_loop_items")]
                         {
                             let mut triple = l.object.value_triple.lock().unwrap();
                             triple.0 = triple.1.take();
@@ -380,13 +455,13 @@ impl<'env> Vm<'env> {
                             triple.2 = l.iterator.next();
                             triple.1.clone()
                         }
-                        #[cfg(not(feature = "adjacent-loop-items"))]
+                        #[cfg(not(feature = "adjacent_loop_items"))]
                         {
                             l.iterator.next()
                         }
                     };
                     match next {
-                        Some(item) => stack.push(item),
+                        Some(item) => stack.push(assert_valid!(item)),
                         None => {
                             pc = *jump_target;
                             continue;
@@ -424,26 +499,10 @@ impl<'env> Vm<'env> {
                         stack.pop();
                     }
                 }
-                #[cfg(feature = "multi-template")]
+                #[cfg(feature = "multi_template")]
                 Instruction::CallBlock(name) => {
-                    if parent_instructions.is_none() {
-                        let old_block = state.current_block;
-                        state.current_block = Some(name);
-                        if let Some(block_stack) = state.blocks.get(name) {
-                            let old_instructions =
-                                mem::replace(&mut state.instructions, block_stack.instructions());
-                            ctx_ok!(state.ctx.push_frame(Frame::default()));
-                            let rv = self.eval_state(state, out);
-                            state.ctx.pop_frame();
-                            state.instructions = old_instructions;
-                            ctx_ok!(rv);
-                        } else {
-                            bail!(Error::new(
-                                ErrorKind::InvalidOperation,
-                                "tried to invoke unknown block"
-                            ));
-                        }
-                        state.current_block = old_block;
+                    if parent_instructions.is_none() && !out.is_discarding() {
+                        self.call_block(name, state, out)?;
                     }
                 }
                 Instruction::PushAutoEscape => {
@@ -461,7 +520,6 @@ impl<'env> Vm<'env> {
                     stack.push(out.end_capture(state.auto_escape));
                 }
                 Instruction::ApplyFilter(name, arg_count, local_id) => {
-                    state.current_call = Some(name);
                     let filter =
                         ctx_ok!(get_or_lookup_local(&mut loaded_filters, *local_id, || {
                             state.env.get_filter(name)
@@ -476,10 +534,8 @@ impl<'env> Vm<'env> {
                     a = ctx_ok!(filter.apply_to(state, args));
                     stack.drop_top(*arg_count);
                     stack.push(a);
-                    state.current_call = Some(name);
                 }
                 Instruction::PerformTest(name, arg_count, local_id) => {
-                    state.current_call = Some(name);
                     let test = ctx_ok!(get_or_lookup_local(&mut loaded_tests, *local_id, || {
                         state.env.get_test(name)
                     })
@@ -490,11 +546,8 @@ impl<'env> Vm<'env> {
                     let rv = ctx_ok!(test.perform(state, args));
                     stack.drop_top(*arg_count);
                     stack.push(Value::from(rv));
-                    state.current_call = None;
                 }
                 Instruction::CallFunction(name, arg_count) => {
-                    state.current_call = Some(name);
-
                     // super is a special function reserved for super-ing into blocks.
                     if *name == "super" {
                         if *arg_count != 0 {
@@ -514,7 +567,7 @@ impl<'env> Vm<'env> {
                         }
                         // leave the one argument on the stack for the recursion
                         recurse_loop!(true);
-                    } else if let Some(func) = state.ctx.load(self.env, name) {
+                    } else if let Some(func) = state.lookup(name) {
                         let args = stack.slice_top(*arg_count);
                         a = ctx_ok!(func.call(state, args));
                         stack.drop_top(*arg_count);
@@ -525,16 +578,12 @@ impl<'env> Vm<'env> {
                             format!("{name} is unknown"),
                         ));
                     }
-
-                    state.current_call = None;
                 }
                 Instruction::CallMethod(name, arg_count) => {
-                    state.current_call = Some(name);
                     let args = stack.slice_top(*arg_count);
                     a = ctx_ok!(args[0].call_method(state, name, &args[1..]));
                     stack.drop_top(*arg_count);
                     stack.push(a);
-                    state.current_call = None;
                 }
                 Instruction::CallObject(arg_count) => {
                     let args = stack.slice_top(*arg_count);
@@ -549,22 +598,20 @@ impl<'env> Vm<'env> {
                     stack.pop();
                 }
                 Instruction::FastSuper => {
-                    // Note that we don't store 'current_call' here since it
-                    // would only be visible (and unused) internally.
                     ctx_ok!(self.perform_super(state, out, false));
                 }
                 Instruction::FastRecurse => {
-                    // Note that we don't store 'current_call' here since it
-                    // would only be visible (and unused) internally.
                     recurse_loop!(false);
                 }
-                // Explanation on the behavior of `LoadBlocks` and `RenderParent`.
+                // Explanation on the behavior of `LoadBlocks` and rendering of
+                // inherited templates:
+                //
                 // MiniJinja inherits the behavior from Jinja2 where extending
                 // loads the blocks (`LoadBlocks`) and the rest of the template
                 // keeps executing but with output disabled, only at the end the
-                // parent template is then invoked (`RenderParent`).  This has the
-                // effect that you can still set variables or declare macros and
-                // that they become visible in the blocks.
+                // parent template is then invoked.  This has the effect that
+                // you can still set variables or declare macros and that they
+                // become visible in the blocks.
                 //
                 // This behavior has a few downsides.  First of all what happens
                 // in the parent template overrides what happens in the child.
@@ -579,7 +626,7 @@ impl<'env> Vm<'env> {
                 // However for the common case this is convenient because it
                 // lets you put some imports there and for as long as you do not
                 // create name clashes this works fine.
-                #[cfg(feature = "multi-template")]
+                #[cfg(feature = "multi_template")]
                 Instruction::LoadBlocks => {
                     a = stack.pop();
                     if parent_instructions.is_some() {
@@ -591,39 +638,17 @@ impl<'env> Vm<'env> {
                     parent_instructions = Some(ctx_ok!(self.load_blocks(a, state)));
                     out.begin_capture(CaptureMode::Discard);
                 }
-                #[cfg(feature = "multi-template")]
-                Instruction::RenderParent => {
-                    // when an extends statement appears in a template, the last instruction
-                    // in that template is the `RenderParent` opcode.  However there is no
-                    // guarantee that we actually encountered the extends tag that would
-                    // have loaded the parent blocks (`LoadBlocks`).  Because of this it's
-                    // possible that we actually end up in this instruction without blocks
-                    // loaded.  In that case we interpret the opcode as if we're breaking
-                    // out of the eval loop.
-                    state.instructions = match parent_instructions.take() {
-                        Some(instr) => instr,
-                        None => break,
-                    };
-                    out.end_capture(AutoEscape::None);
-
-                    // then replace the instructions and set the pc to 0 again.
-                    // this effectively means that the template engine will now
-                    // execute the extended template's code instead.  From this
-                    // there is no way back.
-                    pc = 0;
-                    continue;
-                }
-                #[cfg(feature = "multi-template")]
+                #[cfg(feature = "multi_template")]
                 Instruction::Include(ignore_missing) => {
                     a = stack.pop();
                     ctx_ok!(self.perform_include(a, state, out, *ignore_missing));
                 }
-                #[cfg(feature = "multi-template")]
+                #[cfg(feature = "multi_template")]
                 Instruction::ExportLocals => {
-                    let locals = state.ctx.current_locals();
-                    let mut module = ValueMap::new();
+                    let locals = state.ctx.current_locals_mut();
+                    let mut module = value_map_with_capacity(locals.len());
                     for (key, value) in locals.iter() {
-                        module.insert((*key).into(), value.clone());
+                        module.insert(KeyRef::Value(Value::from(*key)), value.clone());
                     }
                     stack.push(Value(ValueRepr::Map(module.into(), MapType::Normal)));
                 }
@@ -633,6 +658,27 @@ impl<'env> Vm<'env> {
                 }
                 #[cfg(feature = "macros")]
                 Instruction::Return => break,
+                #[cfg(feature = "macros")]
+                Instruction::Enclose(name) => {
+                    // the first time we enclose a value, we need to create a closure
+                    // and store it on the context, and add it to the closure tracker
+                    // for cycle breaking.
+                    if state.ctx.closure().is_none() {
+                        let closure = Arc::new(Closure::default());
+                        state.closure_tracker.track_closure(closure.clone());
+                        state.ctx.reset_closure(Some(closure));
+                    }
+                    state.ctx.enclose(state.env, name);
+                }
+                #[cfg(feature = "macros")]
+                Instruction::GetClosure => {
+                    stack.push(
+                        state
+                            .ctx
+                            .closure()
+                            .map_or(Value::UNDEFINED, |x| Value::from(x.clone())),
+                    );
+                }
             }
             pc += 1;
         }
@@ -640,7 +686,7 @@ impl<'env> Vm<'env> {
         Ok(stack.try_pop())
     }
 
-    #[cfg(feature = "multi-template")]
+    #[cfg(feature = "multi_template")]
     fn perform_include(
         &self,
         name: Value,
@@ -663,7 +709,7 @@ impl<'env> Vm<'env> {
                     "template name was not a string",
                 )
             }));
-            let tmpl = match self.env.get_template(name) {
+            let tmpl = match state.get_template(name) {
                 Ok(tmpl) => tmpl,
                 Err(err) => {
                     if err.kind() == ErrorKind::TemplateNotFound {
@@ -674,11 +720,23 @@ impl<'env> Vm<'env> {
                     continue;
                 }
             };
+
+            let (new_instructions, new_blocks) = ok!(tmpl.instructions_and_blocks());
             let old_escape = mem::replace(&mut state.auto_escape, tmpl.initial_auto_escape());
-            let old_instructions = mem::replace(&mut state.instructions, tmpl.instructions());
-            let old_blocks = mem::replace(&mut state.blocks, prepare_blocks(tmpl.blocks()));
+            let old_instructions = mem::replace(&mut state.instructions, new_instructions);
+            let old_blocks = mem::replace(&mut state.blocks, prepare_blocks(new_blocks));
             ok!(state.ctx.incr_depth(INCLUDE_RECURSION_COST));
-            let rv = self.eval_state(state, out);
+            let rv;
+            #[cfg(feature = "macros")]
+            {
+                let old_closure = state.ctx.take_closure();
+                rv = self.eval_state(state, out);
+                state.ctx.reset_closure(old_closure);
+            }
+            #[cfg(not(feature = "macros"))]
+            {
+                rv = self.eval_state(state, out);
+            }
             state.ctx.decr_depth(INCLUDE_RECURSION_COST);
             state.auto_escape = old_escape;
             state.instructions = old_instructions;
@@ -769,7 +827,7 @@ impl<'env> Vm<'env> {
         }
     }
 
-    #[cfg(feature = "multi-template")]
+    #[cfg(feature = "multi_template")]
     fn load_blocks(
         &self,
         name: Value,
@@ -790,16 +848,42 @@ impl<'env> Vm<'env> {
                 format!("cycle in template inheritance. {name:?} was referenced more than once"),
             ));
         }
-        let tmpl = ok!(self.env.get_template(name));
-        state.loaded_templates.insert(tmpl.instructions().name());
-        for (name, instr) in tmpl.blocks().iter() {
+        let tmpl = ok!(state.get_template(name));
+        let (new_instructions, new_blocks) = ok!(tmpl.instructions_and_blocks());
+        state.loaded_templates.insert(new_instructions.name());
+        for (name, instr) in new_blocks.iter() {
             state
                 .blocks
                 .entry(name)
-                .or_insert_with(BlockStack::default)
+                .or_default()
                 .append_instructions(instr);
         }
-        Ok(tmpl.instructions())
+        Ok(new_instructions)
+    }
+
+    #[cfg(feature = "multi_template")]
+    pub(crate) fn call_block(
+        &self,
+        name: &str,
+        state: &mut State<'_, 'env>,
+        out: &mut Output,
+    ) -> Result<Option<Value>, Error> {
+        if let Some((name, block_stack)) = state.blocks.get_key_value(name) {
+            let old_block = mem::replace(&mut state.current_block, Some(name));
+            let old_instructions =
+                mem::replace(&mut state.instructions, block_stack.instructions());
+            state.ctx.push_frame(Frame::default())?;
+            let rv = self.eval_state(state, out);
+            state.ctx.pop_frame();
+            state.instructions = old_instructions;
+            state.current_block = old_block;
+            rv
+        } else {
+            Err(Error::new(
+                ErrorKind::UnknownBlock,
+                format!("block '{}' not found", name),
+            ))
+        }
     }
 
     fn derive_auto_escape(
@@ -833,7 +917,7 @@ impl<'env> Vm<'env> {
         current_recursion_jump: Option<(usize, bool)>,
     ) -> Result<(), Error> {
         #[allow(unused_mut)]
-        let mut iterator = ok!(iterable.try_iter_owned());
+        let mut iterator = ok!(state.undefined_behavior().try_iter(iterable));
         let len = iterator.len();
         let depth = state
             .ctx
@@ -851,7 +935,7 @@ impl<'env> Vm<'env> {
                     idx: AtomicUsize::new(!0usize),
                     len,
                     depth,
-                    #[cfg(feature = "adjacent-loop-items")]
+                    #[cfg(feature = "adjacent_loop_items")]
                     value_triple: Mutex::new((None, None, iterator.next())),
                     last_changed_value: Mutex::default(),
                 }),
@@ -892,7 +976,7 @@ impl<'env> Vm<'env> {
         name: &str,
         flags: u8,
     ) {
-        use crate::compiler::instructions::{MACRO_CALLER, MACRO_SELF_REFERENTIAL};
+        use crate::compiler::instructions::MACRO_CALLER;
 
         let arg_spec = match stack.pop().0 {
             ValueRepr::Seq(args) => args
@@ -908,14 +992,12 @@ impl<'env> Vm<'env> {
         let macro_ref_id = state.macros.len();
         Arc::make_mut(&mut state.macros).push((state.instructions, offset));
         stack.push(Value::from_object(Macro {
-            data: Arc::new(MacroData {
-                name: Arc::new(name.to_string()),
-                arg_spec,
-                macro_ref_id,
-                closure,
-                self_reference: (flags & MACRO_SELF_REFERENTIAL) != 0,
-                caller_reference: (flags & MACRO_CALLER) != 0,
-            }),
+            name: Arc::from(name.to_string()),
+            arg_spec,
+            macro_ref_id,
+            state_id: state.id,
+            closure,
+            caller_reference: (flags & MACRO_CALLER) != 0,
         }));
     }
 }

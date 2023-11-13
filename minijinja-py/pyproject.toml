@@ -1,10 +1,10 @@
 [build-system]
-requires = ["maturin>=0.14,<0.15"]
+requires = ["maturin>=0.15,<0.16"]
 build-backend = "maturin"
 
 [project]
 name = "minijinja"
-version = "0.30.4"
+version = "1.0.10"
 description = "An experimental Python binding of the Rust MiniJinja template engine."
 requires-python = ">=3.8"
 license = { file = "LICENSE" }
@@ -31,5 +31,6 @@ Repository = "https://github.com/mitsuhiko/minijinja"
 "Donate" = "https://github.com/sponsors/mitsuhiko"
 
 [tool.maturin]
+module-name = "minijinja._lowlevel"
 python-source = "python"
 strip = true

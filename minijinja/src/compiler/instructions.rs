@@ -11,10 +11,6 @@ pub const LOOP_FLAG_WITH_LOOP_VAR: u8 = 1;
 /// This loop is recursive.
 pub const LOOP_FLAG_RECURSIVE: u8 = 2;
 
-/// This macro is self referential.
-#[cfg(feature = "macros")]
-pub const MACRO_SELF_REFERENTIAL: u8 = 1;
-
 /// This macro uses the caller var.
 #[cfg(feature = "macros")]
 pub const MACRO_CALLER: u8 = 2;
@@ -200,23 +196,19 @@ pub enum Instruction<'source> {
     FastRecurse,
 
     /// Call into a block.
-    #[cfg(feature = "multi-template")]
+    #[cfg(feature = "multi_template")]
     CallBlock(&'source str),
 
     /// Loads block from a template with name on stack ("extends")
-    #[cfg(feature = "multi-template")]
+    #[cfg(feature = "multi_template")]
     LoadBlocks,
 
-    /// Renders the parent template
-    #[cfg(feature = "multi-template")]
-    RenderParent,
-
     /// Includes another template.
-    #[cfg(feature = "multi-template")]
+    #[cfg(feature = "multi_template")]
     Include(bool),
 
     /// Builds a module
-    #[cfg(feature = "multi-template")]
+    #[cfg(feature = "multi_template")]
     ExportLocals,
 
     /// Builds a macro on the stack.
@@ -230,6 +222,14 @@ pub enum Instruction<'source> {
     /// True if the value is undefined
     #[cfg(feature = "macros")]
     IsUndefined,
+
+    /// Encloses a variable.
+    #[cfg(feature = "macros")]
+    Enclose(&'source str),
+
+    /// Returns the closure of this context level.
+    #[cfg(feature = "macros")]
+    GetClosure,
 }
 
 #[derive(Copy, Clone)]
@@ -255,14 +255,23 @@ pub struct Instructions<'source> {
     source: &'source str,
 }
 
+pub(crate) static EMPTY_INSTRUCTIONS: Instructions<'static> = Instructions {
+    instructions: Vec::new(),
+    line_infos: Vec::new(),
+    #[cfg(feature = "debug")]
+    span_infos: Vec::new(),
+    name: "<unknown>",
+    source: "",
+};
+
 impl<'source> Instructions<'source> {
     /// Creates a new instructions object.
     pub fn new(name: &'source str, source: &'source str) -> Instructions<'source> {
         Instructions {
-            instructions: Vec::new(),
-            line_infos: Vec::new(),
+            instructions: Vec::with_capacity(128),
+            line_infos: Vec::with_capacity(128),
             #[cfg(feature = "debug")]
-            span_infos: Vec::new(),
+            span_infos: Vec::with_capacity(128),
             name,
             source,
         }
@@ -296,21 +305,21 @@ impl<'source> Instructions<'source> {
         rv
     }
 
-    fn add_line_record(&mut self, instr: usize, line: usize) {
+    fn add_line_record(&mut self, instr: usize, line: u32) {
         let same_loc = self
             .line_infos
             .last()
-            .map_or(false, |last_loc| last_loc.line as usize == line);
+            .map_or(false, |last_loc| last_loc.line == line);
         if !same_loc {
             self.line_infos.push(LineInfo {
                 first_instruction: instr as u32,
-                line: line as u32,
+                line,
             });
         }
     }
 
     /// Adds a new instruction with line number.
-    pub fn add_with_line(&mut self, instr: Instruction<'source>, line: usize) -> usize {
+    pub fn add_with_line(&mut self, instr: Instruction<'source>, line: u32) -> usize {
         let rv = self.add(instr);
         self.add_line_record(rv, line);
 

@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 /// Helper for tracking fuel consumption
 pub struct FuelTracker {
+    // The initial fuel level.
+    initial: u64,
     // This should be an AtomicI64 but sadly 32bit targets do not necessarily have
     // AtomicI64 available.
     remaining: AtomicIsize,
@@ -18,6 +20,7 @@ impl FuelTracker {
     /// shared across nested invocations of the template evaluation.
     pub fn new(fuel: u64) -> Arc<FuelTracker> {
         Arc::new(FuelTracker {
+            initial: fuel,
             remaining: AtomicIsize::new(fuel as isize),
         })
     }
@@ -33,16 +36,22 @@ impl FuelTracker {
         }
         Ok(())
     }
+
+    /// Returns the remaining fuel.
+    pub fn remaining(&self) -> u64 {
+        self.remaining.load(Ordering::Relaxed) as _
+    }
+
+    /// Returns the consumed fuel.
+    pub fn consumed(&self) -> u64 {
+        self.initial.saturating_sub(self.remaining())
+    }
 }
 
 /// How much fuel does an instruction consume?
 fn fuel_for_instruction(instruction: &Instruction) -> isize {
     match instruction {
         Instruction::BeginCapture(_)
-        | Instruction::LoadBlocks
-        | Instruction::RenderParent
-        | Instruction::BuildMacro(..)
-        | Instruction::ExportLocals
         | Instruction::PushLoop(_)
         | Instruction::PushDidNotIterate
         | Instruction::PushWith
@@ -50,8 +59,11 @@ fn fuel_for_instruction(instruction: &Instruction) -> isize {
         | Instruction::DupTop
         | Instruction::DiscardTop
         | Instruction::PushAutoEscape
-        | Instruction::PopAutoEscape
-        | Instruction::Return => 0,
+        | Instruction::PopAutoEscape => 0,
+        #[cfg(feature = "multi_template")]
+        Instruction::ExportLocals => 0,
+        #[cfg(feature = "macros")]
+        Instruction::LoadBlocks | Instruction::BuildMacro(..) | Instruction::Return => 0,
         _ => 1,
     }
 }

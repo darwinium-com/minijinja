@@ -1,9 +1,10 @@
+use std::borrow::Cow;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::Mutex;
 
 use minijinja::value::{Rest, Value};
-use minijinja::{context, AutoEscape, Error, Source, State};
+use minijinja::{context, escape_formatter, AutoEscape, Error, State, Syntax, UndefinedBehavior};
 use pyo3::conversion::AsPyPointer;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -19,9 +20,46 @@ thread_local! {
     static CURRENT_ENV: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 }
 
+macro_rules! syntax_setter {
+    ($slf:expr, $value:expr, $field:ident, $default:expr) => {{
+        let value = $value;
+        let mut inner = $slf.inner.lock().unwrap();
+        if inner.syntax.is_none() {
+            if value == $default {
+                return Ok(());
+            }
+            inner.syntax = Some(Syntax::default());
+        }
+        if let Some(ref mut syntax) = inner.syntax {
+            if syntax.$field != value {
+                syntax.$field = value.into();
+                let new_syntax = syntax.clone();
+                inner.env.set_syntax(new_syntax).map_err(to_py_error)?;
+            }
+        }
+        Ok(())
+    }};
+}
+
+macro_rules! syntax_getter {
+    ($slf:expr, $field:ident, $default:expr) => {{
+        $slf.inner
+            .lock()
+            .unwrap()
+            .syntax
+            .as_ref()
+            .map_or($default, |x| &x.$field)
+            .into()
+    }};
+}
+
 struct Inner {
     env: minijinja::Environment<'static>,
     loader: Option<Py<PyAny>>,
+    auto_escape_callback: Option<Py<PyAny>>,
+    finalizer_callback: Option<Py<PyAny>>,
+    path_join_callback: Option<Py<PyAny>>,
+    syntax: Option<Syntax>,
 }
 
 /// Represents a MiniJinja environment.
@@ -39,6 +77,10 @@ impl Environment {
             inner: Mutex::new(Inner {
                 env: minijinja::Environment::new(),
                 loader: None,
+                auto_escape_callback: None,
+                finalizer_callback: None,
+                path_join_callback: None,
+                syntax: None,
             }),
             reload_before_render: AtomicBool::new(false),
         })
@@ -57,6 +99,39 @@ impl Environment {
     pub fn get_debug(&self) -> PyResult<bool> {
         let inner = self.inner.lock().unwrap();
         Ok(inner.env.debug())
+    }
+
+    /// Sets the undefined behavior.
+    #[setter]
+    pub fn set_undefined_behavior(&self, value: &str) -> PyResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.env.set_undefined_behavior(match value {
+            "strict" => UndefinedBehavior::Strict,
+            "lenient" => UndefinedBehavior::Lenient,
+            "chainable" => UndefinedBehavior::Chainable,
+            _ => {
+                return Err(PyRuntimeError::new_err(
+                    "invalid value for undefined behavior",
+                ))
+            }
+        });
+        Ok(())
+    }
+
+    /// Gets the undefined behavior.
+    #[getter]
+    pub fn get_undefined_behavior(&self) -> PyResult<&'static str> {
+        let inner = self.inner.lock().unwrap();
+        Ok(match inner.env.undefined_behavior() {
+            UndefinedBehavior::Lenient => "lenient",
+            UndefinedBehavior::Chainable => "chainable",
+            UndefinedBehavior::Strict => "strict",
+            _ => {
+                return Err(PyRuntimeError::new_err(
+                    "invalid value for undefined behavior",
+                ))
+            }
+        })
     }
 
     /// Sets fuel
@@ -190,9 +265,9 @@ impl Environment {
             return Err(PyRuntimeError::new_err("expected callback"));
         }
         let callback: Py<PyAny> = callback.into();
-        self.inner
-            .lock()
-            .unwrap()
+        let mut inner = self.inner.lock().unwrap();
+        inner.auto_escape_callback = Some(callback.clone());
+        inner
             .env
             .set_auto_escape_callback(move |name: &str| -> AutoEscape {
                 Python::with_gil(|py| {
@@ -227,6 +302,52 @@ impl Environment {
         Ok(())
     }
 
+    #[getter]
+    pub fn get_auto_escape_callback(&self) -> PyResult<Option<Py<PyAny>>> {
+        Ok(self.inner.lock().unwrap().auto_escape_callback.clone())
+    }
+
+    /// Sets a finalizer.
+    ///
+    /// A finalizer is called before a value is rendered to customize it.
+    #[setter]
+    pub fn set_finalizer(&self, callback: &PyAny) -> PyResult<()> {
+        if !callback.is_callable() {
+            return Err(PyRuntimeError::new_err("expected callback"));
+        }
+        let callback: Py<PyAny> = callback.into();
+        let mut inner = self.inner.lock().unwrap();
+        inner.finalizer_callback = Some(callback.clone());
+        inner.env.set_formatter(move |output, state, value| {
+            Python::with_gil(|py| -> Result<(), Error> {
+                let maybe_new_value = bind_state(state, || -> Result<_, Error> {
+                    let args = std::slice::from_ref(value);
+                    let (py_args, py_kwargs) = to_python_args(py, callback.as_ref(py), args)
+                        .map_err(to_minijinja_error)?;
+                    let rv = callback
+                        .call(py, py_args, py_kwargs)
+                        .map_err(to_minijinja_error)?;
+                    if rv.is(&py.NotImplemented()) {
+                        Ok(None)
+                    } else {
+                        Ok(Some(to_minijinja_value(rv.as_ref(py))))
+                    }
+                })?;
+                let value = match maybe_new_value {
+                    Some(ref new_value) => new_value,
+                    None => value,
+                };
+                escape_formatter(output, state, value)
+            })
+        });
+        Ok(())
+    }
+
+    #[getter]
+    pub fn get_finalizer(&self) -> PyResult<Option<Py<PyAny>>> {
+        Ok(self.inner.lock().unwrap().finalizer_callback.clone())
+    }
+
     /// Sets a loader function for the environment.
     ///
     /// The loader function is invoked with the name of the template to load.  If the
@@ -245,8 +366,9 @@ impl Environment {
         };
         let mut inner = self.inner.lock().unwrap();
         inner.loader = callback.clone();
-        inner.env.set_source(if let Some(callback) = callback {
-            Source::with_loader(move |name| {
+
+        if let Some(callback) = callback {
+            inner.env.set_loader(move |name| {
                 Python::with_gil(|py| {
                     let callback = callback.as_ref(py);
                     let rv = callback
@@ -259,9 +381,8 @@ impl Environment {
                     }
                 })
             })
-        } else {
-            Source::new()
-        });
+        }
+
         Ok(())
     }
 
@@ -271,14 +392,44 @@ impl Environment {
         self.inner.lock().unwrap().loader.clone()
     }
 
+    /// Sets a new path join callback.
+    #[setter]
+    pub fn set_path_join_callback(&self, callback: &PyAny) -> PyResult<()> {
+        if !callback.is_callable() {
+            return Err(PyRuntimeError::new_err("expected callback"));
+        }
+        let callback: Py<PyAny> = callback.into();
+        let mut inner = self.inner.lock().unwrap();
+        inner.path_join_callback = Some(callback.clone());
+        inner.env.set_path_join_callback(move |name, parent| {
+            Python::with_gil(|py| {
+                let callback = callback.as_ref(py);
+                match callback.call1(PyTuple::new(py, [name, parent])) {
+                    Ok(rv) => Cow::Owned(rv.to_string()),
+                    Err(err) => {
+                        report_unraisable(py, err);
+                        Cow::Borrowed(name)
+                    }
+                }
+            })
+        });
+        Ok(())
+    }
+
+    /// Returns the current path join callback.
+    #[getter]
+    pub fn get_path_join_callback(&self) -> Option<Py<PyAny>> {
+        self.inner.lock().unwrap().path_join_callback.clone()
+    }
+
     /// Triggers a reload of the templates.
     pub fn reload(&self) -> PyResult<()> {
-        let loader = self.inner.lock().unwrap().loader.as_ref().cloned();
-        if let Some(loader) = loader {
-            Python::with_gil(|py| self.set_loader(Some(loader.as_ref(py))))
-        } else {
-            Ok(())
+        let mut inner = self.inner.lock().unwrap();
+        let loader = inner.loader.as_ref().cloned();
+        if loader.is_some() {
+            inner.env.clear_templates();
         }
+        Ok(())
     }
 
     /// Can be used to instruct the environment to automatically reload templates
@@ -293,25 +444,100 @@ impl Environment {
         self.reload_before_render.load(Ordering::Relaxed)
     }
 
+    #[setter]
+    pub fn set_variable_start_string(&self, value: String) -> PyResult<()> {
+        syntax_setter!(self, value, variable_start, "{{")
+    }
+
+    #[getter]
+    pub fn get_variable_start_string(&self) -> String {
+        syntax_getter!(self, variable_start, "{{")
+    }
+
+    #[setter]
+    pub fn set_block_start_string(&self, value: String) -> PyResult<()> {
+        syntax_setter!(self, value, block_start, "{%")
+    }
+
+    #[getter]
+    pub fn get_block_start_string(&self) -> String {
+        syntax_getter!(self, block_start, "{%")
+    }
+
+    #[setter]
+    pub fn set_comment_start_string(&self, value: String) -> PyResult<()> {
+        syntax_setter!(self, value, comment_start, "{#")
+    }
+
+    #[getter]
+    pub fn get_comment_start_string(&self) -> String {
+        syntax_getter!(self, comment_start, "{#")
+    }
+
+    #[setter]
+    pub fn set_variable_end_string(&self, value: String) -> PyResult<()> {
+        syntax_setter!(self, value, variable_end, "}}")
+    }
+
+    #[getter]
+    pub fn get_variable_end_string(&self) -> String {
+        syntax_getter!(self, variable_end, "}}")
+    }
+
+    #[setter]
+    pub fn set_block_end_string(&self, value: String) -> PyResult<()> {
+        syntax_setter!(self, value, block_end, "%}")
+    }
+
+    #[getter]
+    pub fn get_block_end_string(&self) -> String {
+        syntax_getter!(self, block_end, "%}")
+    }
+
+    #[setter]
+    pub fn set_comment_end_string(&self, value: String) -> PyResult<()> {
+        syntax_setter!(self, value, comment_end, "#}")
+    }
+
+    #[getter]
+    pub fn get_comment_end_string(&self) -> String {
+        syntax_getter!(self, comment_end, "#}")
+    }
+
+    /// Configures the trailing newline trimming feature.
+    #[setter]
+    pub fn set_keep_trailing_newline(&self, yes: bool) -> PyResult<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .env
+            .set_keep_trailing_newline(yes);
+        Ok(())
+    }
+
+    /// Returns the current value of the trailing newline trimming flag.
+    #[getter]
+    pub fn get_keep_trailing_newline(&self) -> PyResult<bool> {
+        Ok(self.inner.lock().unwrap().env.keep_trailing_newline())
+    }
+
     /// Manually adds a template to the environment.
-    pub fn add_template(&self, name: &str, source: &str) -> PyResult<()> {
+    pub fn add_template(&self, name: String, source: String) -> PyResult<()> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.env.source().is_none() {
-            inner.env.set_source(Source::new());
-        }
         inner
             .env
-            .source_mut()
-            .unwrap()
-            .add_template(name, source)
+            .add_template_owned(name, source)
             .map_err(to_py_error)
     }
 
     /// Removes a loaded template.
     pub fn remove_template(&self, name: &str) {
-        if let Some(source) = self.inner.lock().unwrap().env.source_mut() {
-            source.remove_template(name);
-        }
+        self.inner.lock().unwrap().env.remove_template(name);
+    }
+
+    /// Clears all loaded templates.
+    pub fn clear_templates(&self) {
+        self.inner.lock().unwrap().env.clear_templates();
     }
 
     /// Renders a template looked up from the loader.

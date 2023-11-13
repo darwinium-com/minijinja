@@ -31,7 +31,7 @@ impl StructObject for DictLikeObject {
         })
     }
 
-    fn fields(&self) -> Vec<Arc<String>> {
+    fn fields(&self) -> Vec<Arc<str>> {
         Python::with_gil(|py| {
             let inner = self.inner.as_ref(py);
             inner.keys().iter().map(|x| x.to_string().into()).collect()
@@ -255,13 +255,6 @@ fn to_python_value_impl(py: Python<'_>, value: Value) -> PyResult<Py<PyAny>> {
                 } else if let Ok(rv) = TryInto::<u64>::try_into(value.clone()) {
                     Ok(rv.into_py(py))
                 } else if let Ok(rv) = TryInto::<f64>::try_into(value) {
-                    Ok(rv.into_py(py))
-                } else {
-                    unreachable!()
-                }
-            }
-            ValueKind::Char => {
-                if let Ok(rv) = TryInto::<char>::try_into(value.clone()) {
                     Ok(rv.into_py(py))
                 } else {
                     unreachable!()

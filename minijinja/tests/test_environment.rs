@@ -46,6 +46,25 @@ fn test_expression_lifetimes() {
 }
 
 #[test]
+fn test_expression_undeclared_variables() {
+    let env = Environment::new();
+    let expr = env.compile_expression("[foo, bar.baz]").unwrap();
+    let undeclared = expr.undeclared_variables(false);
+    assert_eq!(
+        undeclared,
+        ["bar", "foo"].into_iter().map(|x| x.to_string()).collect()
+    );
+    let undeclared = expr.undeclared_variables(true);
+    assert_eq!(
+        undeclared,
+        ["foo", "bar.baz"]
+            .into_iter()
+            .map(|x| x.to_string())
+            .collect()
+    );
+}
+
+#[test]
 fn test_clone() {
     let mut env = Environment::new();
     env.add_template("test", "a").unwrap();
@@ -71,4 +90,49 @@ fn test_template_removal() {
     env.add_template("test", "{{ a }}").unwrap();
     env.remove_template("test");
     assert!(env.get_template("test").is_err());
+}
+
+#[test]
+#[cfg(feature = "multi_template")]
+fn test_path_join() {
+    let mut env = Environment::new();
+    env.add_template("x/a/foo.txt", "{% include '../b/bar.txt' %}")
+        .unwrap();
+    env.add_template("x/b/bar.txt", "bar.txt").unwrap();
+    env.set_path_join_callback(|name, parent| {
+        let mut rv = parent.split('/').collect::<Vec<_>>();
+        rv.pop();
+        name.split('/').for_each(|segment| match segment {
+            "." => {}
+            ".." => {
+                rv.pop();
+            }
+            other => rv.push(other),
+        });
+        rv.join("/").into()
+    });
+    let t = env.get_template("x/a/foo.txt").unwrap();
+    assert_eq!(t.render(()).unwrap(), "bar.txt");
+}
+
+#[test]
+fn test_keep_trailing_newlines() {
+    let mut env = Environment::new();
+    env.add_template("foo.txt", "blub\r\n").unwrap();
+    assert_eq!(env.render_str("blub\r\n", ()).unwrap(), "blub");
+
+    env.set_keep_trailing_newline(true);
+    env.add_template("foo_keep.txt", "blub\r\n").unwrap();
+    assert_eq!(
+        env.get_template("foo.txt").unwrap().render(()).unwrap(),
+        "blub"
+    );
+    assert_eq!(
+        env.get_template("foo_keep.txt")
+            .unwrap()
+            .render(())
+            .unwrap(),
+        "blub\r\n"
+    );
+    assert_eq!(env.render_str("blub\r\n", ()).unwrap(), "blub\r\n");
 }

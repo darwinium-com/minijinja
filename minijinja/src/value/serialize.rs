@@ -1,19 +1,50 @@
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{ser, Serialize, Serializer};
 
-use crate::error::Error;
-use crate::key::{Key, KeySerializer, StaticKey};
+use crate::utils::untrusted_size_hint;
 use crate::value::{
-    Arc, MapType, Packed, StringType, Value, ValueMap, ValueRepr, VALUE_HANDLES,
-    VALUE_HANDLE_MARKER,
+    value_map_with_capacity, Arc, KeyRef, MapType, Packed, StringType, Value, ValueMap, ValueRepr,
+    VALUE_HANDLES, VALUE_HANDLE_MARKER,
 };
+
+#[derive(Debug)]
+pub struct InvalidValue(Arc<str>);
+
+impl std::error::Error for InvalidValue {}
+
+impl fmt::Display for InvalidValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl serde::ser::Error for InvalidValue {
+    fn custom<T>(msg: T) -> Self
+    where
+        T: fmt::Display,
+    {
+        InvalidValue(Arc::from(msg.to_string()))
+    }
+}
+
+/// Transforms a serializable value to a value object.
+///
+/// This neither fails nor panics.  For objects that cannot be represented
+/// the value might be represented as a half broken error object.
+pub fn transform<T: Serialize>(value: T) -> Value {
+    match value.serialize(ValueSerializer) {
+        Ok(rv) => rv,
+        Err(invalid) => ValueRepr::Invalid(invalid.0).into(),
+    }
+}
 
 pub struct ValueSerializer;
 
 impl Serializer for ValueSerializer {
     type Ok = Value;
-    type Error = Error;
+    type Error = InvalidValue;
 
     type SerializeSeq = SerializeSeq;
     type SerializeTuple = SerializeTuple;
@@ -23,107 +54,116 @@ impl Serializer for ValueSerializer {
     type SerializeStruct = SerializeStruct;
     type SerializeStructVariant = SerializeStructVariant;
 
-    fn serialize_bool(self, v: bool) -> Result<Value, Error> {
+    fn serialize_bool(self, v: bool) -> Result<Value, InvalidValue> {
         Ok(ValueRepr::Bool(v).into())
     }
 
-    fn serialize_i8(self, v: i8) -> Result<Value, Error> {
+    fn serialize_i8(self, v: i8) -> Result<Value, InvalidValue> {
         Ok(ValueRepr::I64(v as i64).into())
     }
 
-    fn serialize_i16(self, v: i16) -> Result<Value, Error> {
+    fn serialize_i16(self, v: i16) -> Result<Value, InvalidValue> {
         Ok(ValueRepr::I64(v as i64).into())
     }
 
-    fn serialize_i32(self, v: i32) -> Result<Value, Error> {
+    fn serialize_i32(self, v: i32) -> Result<Value, InvalidValue> {
         Ok(ValueRepr::I64(v as i64).into())
     }
 
-    fn serialize_i64(self, v: i64) -> Result<Value, Error> {
+    fn serialize_i64(self, v: i64) -> Result<Value, InvalidValue> {
         Ok(ValueRepr::I64(v).into())
     }
 
-    fn serialize_i128(self, v: i128) -> Result<Value, Error> {
+    fn serialize_i128(self, v: i128) -> Result<Value, InvalidValue> {
         Ok(ValueRepr::I128(Packed(v)).into())
     }
 
-    fn serialize_u8(self, v: u8) -> Result<Value, Error> {
+    fn serialize_u8(self, v: u8) -> Result<Value, InvalidValue> {
         Ok(ValueRepr::U64(v as u64).into())
     }
 
-    fn serialize_u16(self, v: u16) -> Result<Value, Error> {
+    fn serialize_u16(self, v: u16) -> Result<Value, InvalidValue> {
         Ok(ValueRepr::U64(v as u64).into())
     }
 
-    fn serialize_u32(self, v: u32) -> Result<Value, Error> {
+    fn serialize_u32(self, v: u32) -> Result<Value, InvalidValue> {
         Ok(ValueRepr::U64(v as u64).into())
     }
 
-    fn serialize_u64(self, v: u64) -> Result<Value, Error> {
+    fn serialize_u64(self, v: u64) -> Result<Value, InvalidValue> {
         Ok(ValueRepr::U64(v).into())
     }
 
-    fn serialize_u128(self, v: u128) -> Result<Value, Error> {
+    fn serialize_u128(self, v: u128) -> Result<Value, InvalidValue> {
         Ok(ValueRepr::U128(Packed(v)).into())
     }
 
-    fn serialize_f32(self, v: f32) -> Result<Value, Error> {
+    fn serialize_f32(self, v: f32) -> Result<Value, InvalidValue> {
         Ok(ValueRepr::F64(v as f64).into())
     }
 
-    fn serialize_f64(self, v: f64) -> Result<Value, Error> {
+    fn serialize_f64(self, v: f64) -> Result<Value, InvalidValue> {
         Ok(ValueRepr::F64(v).into())
     }
 
-    fn serialize_char(self, v: char) -> Result<Value, Error> {
-        Ok(ValueRepr::Char(v).into())
+    fn serialize_char(self, v: char) -> Result<Value, InvalidValue> {
+        Ok(ValueRepr::String(Arc::from(v.to_string()), StringType::Normal).into())
     }
 
-    fn serialize_str(self, value: &str) -> Result<Value, Error> {
-        Ok(ValueRepr::String(Arc::new(value.to_owned()), StringType::Normal).into())
+    fn serialize_str(self, value: &str) -> Result<Value, InvalidValue> {
+        Ok(ValueRepr::String(Arc::from(value.to_owned()), StringType::Normal).into())
     }
 
-    fn serialize_bytes(self, value: &[u8]) -> Result<Value, Error> {
+    fn serialize_bytes(self, value: &[u8]) -> Result<Value, InvalidValue> {
         Ok(ValueRepr::Bytes(Arc::new(value.to_owned())).into())
     }
 
-    fn serialize_none(self) -> Result<Value, Error> {
+    fn serialize_none(self) -> Result<Value, InvalidValue> {
         Ok(ValueRepr::None.into())
     }
 
-    fn serialize_some<T: ?Sized>(self, value: &T) -> Result<Value, Error>
+    fn serialize_some<T: ?Sized>(self, value: &T) -> Result<Value, InvalidValue>
     where
         T: Serialize,
     {
-        value.serialize(self)
+        Ok(transform(value))
     }
 
-    fn serialize_unit(self) -> Result<Value, Error> {
+    fn serialize_unit(self) -> Result<Value, InvalidValue> {
         Ok(ValueRepr::None.into())
     }
 
-    fn serialize_unit_struct(self, _name: &'static str) -> Result<Value, Error> {
+    fn serialize_unit_struct(self, _name: &'static str) -> Result<Value, InvalidValue> {
         Ok(ValueRepr::None.into())
     }
 
     fn serialize_unit_variant(
         self,
-        _name: &'static str,
-        _variant_index: u32,
+        name: &'static str,
+        variant_index: u32,
         variant: &'static str,
-    ) -> Result<Value, Error> {
-        Ok(Value::from(variant))
+    ) -> Result<Value, InvalidValue> {
+        if name == VALUE_HANDLE_MARKER && variant == VALUE_HANDLE_MARKER {
+            Ok(VALUE_HANDLES.with(|handles| {
+                let mut handles = handles.borrow_mut();
+                handles
+                    .remove(&variant_index)
+                    .expect("value handle not in registry")
+            }))
+        } else {
+            Ok(Value::from(variant))
+        }
     }
 
     fn serialize_newtype_struct<T: ?Sized>(
         self,
         _name: &'static str,
         value: &T,
-    ) -> Result<Value, Error>
+    ) -> Result<Value, InvalidValue>
     where
         T: Serialize,
     {
-        value.serialize(self)
+        Ok(transform(value))
     }
 
     fn serialize_newtype_variant<T: ?Sized>(
@@ -132,24 +172,24 @@ impl Serializer for ValueSerializer {
         _variant_index: u32,
         variant: &'static str,
         value: &T,
-    ) -> Result<Value, Error>
+    ) -> Result<Value, InvalidValue>
     where
         T: Serialize,
     {
-        let mut map = ValueMap::new();
-        map.insert(Key::Str(variant), ok!(value.serialize(self)));
+        let mut map = value_map_with_capacity(1);
+        map.insert(KeyRef::Str(variant), transform(value));
         Ok(ValueRepr::Map(Arc::new(map), MapType::Normal).into())
     }
 
-    fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq, Error> {
+    fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq, InvalidValue> {
         Ok(SerializeSeq {
-            elements: Vec::with_capacity(len.unwrap_or(0)),
+            elements: Vec::with_capacity(untrusted_size_hint(len.unwrap_or(0))),
         })
     }
 
-    fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple, Error> {
+    fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple, InvalidValue> {
         Ok(SerializeTuple {
-            elements: Vec::with_capacity(len),
+            elements: Vec::with_capacity(untrusted_size_hint(len)),
         })
     }
 
@@ -157,9 +197,9 @@ impl Serializer for ValueSerializer {
         self,
         _name: &'static str,
         len: usize,
-    ) -> Result<Self::SerializeTupleStruct, Error> {
+    ) -> Result<Self::SerializeTupleStruct, InvalidValue> {
         Ok(SerializeTupleStruct {
-            fields: Vec::with_capacity(len),
+            fields: Vec::with_capacity(untrusted_size_hint(len)),
         })
     }
 
@@ -169,28 +209,27 @@ impl Serializer for ValueSerializer {
         _variant_index: u32,
         variant: &'static str,
         len: usize,
-    ) -> Result<Self::SerializeTupleVariant, Error> {
+    ) -> Result<Self::SerializeTupleVariant, InvalidValue> {
         Ok(SerializeTupleVariant {
             name: variant,
-            fields: Vec::with_capacity(len),
+            fields: Vec::with_capacity(untrusted_size_hint(len)),
         })
     }
 
-    fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap, Error> {
+    fn serialize_map(self, len: Option<usize>) -> Result<Self::SerializeMap, InvalidValue> {
         Ok(SerializeMap {
-            entries: ValueMap::new(),
+            entries: value_map_with_capacity(len.unwrap_or(0)),
             key: None,
         })
     }
 
     fn serialize_struct(
         self,
-        name: &'static str,
-        _len: usize,
-    ) -> Result<Self::SerializeStruct, Error> {
+        _name: &'static str,
+        len: usize,
+    ) -> Result<Self::SerializeStruct, InvalidValue> {
         Ok(SerializeStruct {
-            name,
-            fields: ValueMap::new(),
+            fields: value_map_with_capacity(len),
         })
     }
 
@@ -199,11 +238,11 @@ impl Serializer for ValueSerializer {
         _name: &'static str,
         _variant_index: u32,
         variant: &'static str,
-        _len: usize,
-    ) -> Result<Self::SerializeStructVariant, Error> {
+        len: usize,
+    ) -> Result<Self::SerializeStructVariant, InvalidValue> {
         Ok(SerializeStructVariant {
             variant,
-            map: ValueMap::new(),
+            map: value_map_with_capacity(len),
         })
     }
 }
@@ -214,18 +253,17 @@ pub struct SerializeSeq {
 
 impl ser::SerializeSeq for SerializeSeq {
     type Ok = Value;
-    type Error = Error;
+    type Error = InvalidValue;
 
-    fn serialize_element<T: ?Sized>(&mut self, value: &T) -> Result<(), Error>
+    fn serialize_element<T: ?Sized>(&mut self, value: &T) -> Result<(), InvalidValue>
     where
         T: Serialize,
     {
-        let value = ok!(value.serialize(ValueSerializer));
-        self.elements.push(value);
+        self.elements.push(transform(value));
         Ok(())
     }
 
-    fn end(self) -> Result<Value, Error> {
+    fn end(self) -> Result<Value, InvalidValue> {
         Ok(ValueRepr::Seq(Arc::new(self.elements)).into())
     }
 }
@@ -236,18 +274,17 @@ pub struct SerializeTuple {
 
 impl ser::SerializeTuple for SerializeTuple {
     type Ok = Value;
-    type Error = Error;
+    type Error = InvalidValue;
 
-    fn serialize_element<T: ?Sized>(&mut self, value: &T) -> Result<(), Error>
+    fn serialize_element<T: ?Sized>(&mut self, value: &T) -> Result<(), InvalidValue>
     where
         T: Serialize,
     {
-        let value = ok!(value.serialize(ValueSerializer));
-        self.elements.push(value);
+        self.elements.push(transform(value));
         Ok(())
     }
 
-    fn end(self) -> Result<Value, Error> {
+    fn end(self) -> Result<Value, InvalidValue> {
         Ok(ValueRepr::Seq(Arc::new(self.elements)).into())
     }
 }
@@ -258,18 +295,17 @@ pub struct SerializeTupleStruct {
 
 impl ser::SerializeTupleStruct for SerializeTupleStruct {
     type Ok = Value;
-    type Error = Error;
+    type Error = InvalidValue;
 
-    fn serialize_field<T: ?Sized>(&mut self, value: &T) -> Result<(), Error>
+    fn serialize_field<T: ?Sized>(&mut self, value: &T) -> Result<(), InvalidValue>
     where
         T: Serialize,
     {
-        let value = ok!(value.serialize(ValueSerializer));
-        self.fields.push(value);
+        self.fields.push(transform(value));
         Ok(())
     }
 
-    fn end(self) -> Result<Value, Error> {
+    fn end(self) -> Result<Value, InvalidValue> {
         Ok(Value(ValueRepr::Seq(Arc::new(self.fields))))
     }
 }
@@ -281,21 +317,20 @@ pub struct SerializeTupleVariant {
 
 impl ser::SerializeTupleVariant for SerializeTupleVariant {
     type Ok = Value;
-    type Error = Error;
+    type Error = InvalidValue;
 
-    fn serialize_field<T: ?Sized>(&mut self, value: &T) -> Result<(), Error>
+    fn serialize_field<T: ?Sized>(&mut self, value: &T) -> Result<(), InvalidValue>
     where
         T: Serialize,
     {
-        let value = ok!(value.serialize(ValueSerializer));
-        self.fields.push(value);
+        self.fields.push(transform(value));
         Ok(())
     }
 
-    fn end(self) -> Result<Value, Error> {
-        let mut map = ValueMap::new();
+    fn end(self) -> Result<Value, InvalidValue> {
+        let mut map = value_map_with_capacity(1);
         map.insert(
-            Key::Str(self.name),
+            KeyRef::Str(self.name),
             Value(ValueRepr::Seq(self.fields.into())),
         );
         Ok(Value(ValueRepr::Map(map.into(), MapType::Normal)))
@@ -304,88 +339,79 @@ impl ser::SerializeTupleVariant for SerializeTupleVariant {
 
 pub struct SerializeMap {
     entries: ValueMap,
-    key: Option<StaticKey>,
+    key: Option<Value>,
 }
 
 impl ser::SerializeMap for SerializeMap {
     type Ok = Value;
-    type Error = Error;
+    type Error = InvalidValue;
 
-    fn serialize_key<T: ?Sized>(&mut self, key: &T) -> Result<(), Error>
+    fn serialize_key<T: ?Sized>(&mut self, key: &T) -> Result<(), InvalidValue>
     where
         T: Serialize,
     {
-        let key = ok!(key.serialize(KeySerializer));
-        self.key = Some(key);
+        match key.serialize(ValueSerializer) {
+            Ok(key) => self.key = Some(key),
+            Err(_) => self.key = None,
+        }
         Ok(())
     }
 
-    fn serialize_value<T: ?Sized>(&mut self, value: &T) -> Result<(), Error>
+    fn serialize_value<T: ?Sized>(&mut self, value: &T) -> Result<(), InvalidValue>
     where
         T: Serialize,
     {
-        let key = self
-            .key
-            .take()
-            .expect("serialize_value called before serialize_key");
-        let value = ok!(value.serialize(ValueSerializer));
-        self.entries.insert(key, value);
+        if let Some(key) = self.key.take() {
+            self.entries.insert(KeyRef::Value(key), transform(value));
+        }
         Ok(())
     }
 
-    fn end(self) -> Result<Value, Error> {
+    fn end(self) -> Result<Value, InvalidValue> {
         Ok(Value(ValueRepr::Map(
             Arc::new(self.entries),
             MapType::Normal,
         )))
     }
 
-    fn serialize_entry<K: ?Sized, V: ?Sized>(&mut self, key: &K, value: &V) -> Result<(), Error>
+    fn serialize_entry<K: ?Sized, V: ?Sized>(
+        &mut self,
+        key: &K,
+        value: &V,
+    ) -> Result<(), InvalidValue>
     where
         K: Serialize,
         V: Serialize,
     {
-        let key = ok!(key.serialize(KeySerializer));
-        let value = ok!(value.serialize(ValueSerializer));
-        self.entries.insert(key, value);
+        if let Ok(key) = key.serialize(ValueSerializer) {
+            self.entries.insert(KeyRef::Value(key), transform(value));
+        }
         Ok(())
     }
 }
 
 pub struct SerializeStruct {
-    name: &'static str,
     fields: ValueMap,
 }
 
 impl ser::SerializeStruct for SerializeStruct {
     type Ok = Value;
-    type Error = Error;
+    type Error = InvalidValue;
 
-    fn serialize_field<T: ?Sized>(&mut self, key: &'static str, value: &T) -> Result<(), Error>
+    fn serialize_field<T: ?Sized>(
+        &mut self,
+        key: &'static str,
+        value: &T,
+    ) -> Result<(), InvalidValue>
     where
         T: Serialize,
     {
-        let value = ok!(value.serialize(ValueSerializer));
-        self.fields.insert(Key::Str(key), value);
+        self.fields.insert(KeyRef::Str(key), transform(value));
         Ok(())
     }
 
-    fn end(self) -> Result<Value, Error> {
-        match self.name {
-            VALUE_HANDLE_MARKER => {
-                let handle_id = match self.fields.get(&Key::Str("handle")) {
-                    Some(&Value(ValueRepr::U64(handle_id))) => handle_id as usize,
-                    _ => panic!("bad handle reference in value roundtrip"),
-                };
-                Ok(VALUE_HANDLES.with(|handles| {
-                    let mut handles = handles.borrow_mut();
-                    handles
-                        .remove(&handle_id)
-                        .expect("value handle not in registry")
-                }))
-            }
-            _ => Ok(ValueRepr::Map(Arc::new(self.fields), MapType::Normal).into()),
-        }
+    fn end(self) -> Result<Value, InvalidValue> {
+        Ok(ValueRepr::Map(Arc::new(self.fields), MapType::Normal).into())
     }
 }
 
@@ -396,18 +422,21 @@ pub struct SerializeStructVariant {
 
 impl ser::SerializeStructVariant for SerializeStructVariant {
     type Ok = Value;
-    type Error = Error;
+    type Error = InvalidValue;
 
-    fn serialize_field<T: ?Sized>(&mut self, key: &'static str, value: &T) -> Result<(), Error>
+    fn serialize_field<T: ?Sized>(
+        &mut self,
+        key: &'static str,
+        value: &T,
+    ) -> Result<(), InvalidValue>
     where
         T: Serialize,
     {
-        let value = ok!(value.serialize(ValueSerializer));
-        self.map.insert(Key::Str(key), value);
+        self.map.insert(KeyRef::Str(key), transform(value));
         Ok(())
     }
 
-    fn end(self) -> Result<Value, Error> {
+    fn end(self) -> Result<Value, InvalidValue> {
         let mut rv = BTreeMap::new();
         rv.insert(
             self.variant,

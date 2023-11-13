@@ -4,8 +4,7 @@ use std::ops::Deref;
 use std::fmt;
 
 use crate::compiler::tokens::Span;
-use crate::key::Key;
-use crate::value::{MapType, Value, ValueMap, ValueRepr};
+use crate::value::{value_map_with_capacity, KeyRef, MapType, Value, ValueRepr};
 
 /// Container for nodes with location info.
 ///
@@ -67,15 +66,15 @@ pub enum Stmt<'a> {
     SetBlock(Spanned<SetBlock<'a>>),
     AutoEscape(Spanned<AutoEscape<'a>>),
     FilterBlock(Spanned<FilterBlock<'a>>),
-    #[cfg(feature = "multi-template")]
+    #[cfg(feature = "multi_template")]
     Block(Spanned<Block<'a>>),
-    #[cfg(feature = "multi-template")]
+    #[cfg(feature = "multi_template")]
     Import(Spanned<Import<'a>>),
-    #[cfg(feature = "multi-template")]
+    #[cfg(feature = "multi_template")]
     FromImport(Spanned<FromImport<'a>>),
-    #[cfg(feature = "multi-template")]
+    #[cfg(feature = "multi_template")]
     Extends(Spanned<Extends<'a>>),
-    #[cfg(feature = "multi-template")]
+    #[cfg(feature = "multi_template")]
     Include(Spanned<Include<'a>>),
     #[cfg(feature = "macros")]
     Macro(Spanned<Macro<'a>>),
@@ -98,15 +97,15 @@ impl<'a> fmt::Debug for Stmt<'a> {
             Stmt::SetBlock(s) => fmt::Debug::fmt(s, f),
             Stmt::AutoEscape(s) => fmt::Debug::fmt(s, f),
             Stmt::FilterBlock(s) => fmt::Debug::fmt(s, f),
-            #[cfg(feature = "multi-template")]
+            #[cfg(feature = "multi_template")]
             Stmt::Block(s) => fmt::Debug::fmt(s, f),
-            #[cfg(feature = "multi-template")]
+            #[cfg(feature = "multi_template")]
             Stmt::Extends(s) => fmt::Debug::fmt(s, f),
-            #[cfg(feature = "multi-template")]
+            #[cfg(feature = "multi_template")]
             Stmt::Include(s) => fmt::Debug::fmt(s, f),
-            #[cfg(feature = "multi-template")]
+            #[cfg(feature = "multi_template")]
             Stmt::Import(s) => fmt::Debug::fmt(s, f),
-            #[cfg(feature = "multi-template")]
+            #[cfg(feature = "multi_template")]
             Stmt::FromImport(s) => fmt::Debug::fmt(s, f),
             #[cfg(feature = "macros")]
             Stmt::Macro(s) => fmt::Debug::fmt(s, f),
@@ -239,7 +238,7 @@ pub struct SetBlock<'a> {
 
 /// A block for inheritance elements.
 #[cfg_attr(feature = "internal_debug", derive(Debug))]
-#[cfg(feature = "multi-template")]
+#[cfg(feature = "multi_template")]
 #[cfg_attr(feature = "unstable_machinery_serde", derive(serde::Serialize))]
 pub struct Block<'a> {
     pub name: &'a str,
@@ -248,7 +247,7 @@ pub struct Block<'a> {
 
 /// An extends block.
 #[cfg_attr(feature = "internal_debug", derive(Debug))]
-#[cfg(feature = "multi-template")]
+#[cfg(feature = "multi_template")]
 #[cfg_attr(feature = "unstable_machinery_serde", derive(serde::Serialize))]
 pub struct Extends<'a> {
     pub name: Expr<'a>,
@@ -256,7 +255,7 @@ pub struct Extends<'a> {
 
 /// An include block.
 #[cfg_attr(feature = "internal_debug", derive(Debug))]
-#[cfg(feature = "multi-template")]
+#[cfg(feature = "multi_template")]
 #[cfg_attr(feature = "unstable_machinery_serde", derive(serde::Serialize))]
 pub struct Include<'a> {
     pub name: Expr<'a>,
@@ -308,7 +307,7 @@ pub struct Do<'a> {
 
 /// A "from" import
 #[cfg_attr(feature = "internal_debug", derive(Debug))]
-#[cfg(feature = "multi-template")]
+#[cfg(feature = "multi_template")]
 #[cfg_attr(feature = "unstable_machinery_serde", derive(serde::Serialize))]
 pub struct FromImport<'a> {
     pub expr: Expr<'a>,
@@ -317,7 +316,7 @@ pub struct FromImport<'a> {
 
 /// A full module import
 #[cfg_attr(feature = "internal_debug", derive(Debug))]
-#[cfg(feature = "multi-template")]
+#[cfg(feature = "multi_template")]
 #[cfg_attr(feature = "unstable_machinery_serde", derive(serde::Serialize))]
 pub struct Import<'a> {
     pub expr: Expr<'a>,
@@ -497,10 +496,10 @@ impl<'a> Kwargs<'a> {
             return None;
         }
 
-        let mut rv = ValueMap::new();
+        let mut rv = value_map_with_capacity(self.pairs.len());
         for (key, value) in &self.pairs {
             if let Expr::Const(value) = value {
-                rv.insert(Key::make_string_key(key), value.value.clone());
+                rv.insert(KeyRef::Value(Value::from(*key)), value.value.clone());
             }
         }
 
@@ -524,16 +523,10 @@ impl<'a> Map<'a> {
             return None;
         }
 
-        let mut rv = ValueMap::new();
+        let mut rv = value_map_with_capacity(self.keys.len());
         for (key, value) in self.keys.iter().zip(self.values.iter()) {
             if let (Expr::Const(maybe_key), Expr::Const(value)) = (key, value) {
-                rv.insert(
-                    match maybe_key.value.clone().try_into_key() {
-                        Ok(key) => key,
-                        Err(_) => return None,
-                    },
-                    value.value.clone(),
-                );
+                rv.insert(KeyRef::Value(maybe_key.value.clone()), value.value.clone());
             }
         }
 
@@ -547,7 +540,7 @@ impl<'a> Map<'a> {
 pub enum CallType<'ast, 'source> {
     Function(&'source str),
     Method(&'ast Expr<'source>, &'source str),
-    #[cfg(feature = "multi-template")]
+    #[cfg(feature = "multi_template")]
     Block(&'source str),
     Object(&'ast Expr<'source>),
 }
@@ -562,7 +555,7 @@ impl<'a> Call<'a> {
         match self.expr {
             Expr::Var(ref var) => CallType::Function(var.id),
             Expr::GetAttr(ref attr) => {
-                #[cfg(feature = "multi-template")]
+                #[cfg(feature = "multi_template")]
                 {
                     if let Expr::Var(ref var) = attr.expr {
                         if var.id == "self" {

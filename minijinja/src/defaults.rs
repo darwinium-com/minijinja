@@ -18,14 +18,17 @@ pub(crate) fn no_auto_escape(_: &str) -> AutoEscape {
 /// * [`Html`](AutoEscape::Html): `.html`, `.htm`, `.xml`
 #[cfg_attr(
     feature = "json",
-    doc = r" * [`Json`](AutoEscape::Json): `.json`, `.js`, `.yml`"
+    doc = r" * [`Json`](AutoEscape::Json): `.json`, `.json5`, `.js`, `.yaml`, `.yml`"
 )]
 /// * [`None`](AutoEscape::None): _all others_
+///
+/// Additionally `.j2` as final extension is ignored. So `.html.j2` is the
+/// considered the same as `.html`.
 pub fn default_auto_escape_callback(name: &str) -> AutoEscape {
-    match name.rsplit('.').next() {
+    match name.strip_suffix(".j2").unwrap_or(name).rsplit('.').next() {
         Some("html" | "htm" | "xml") => AutoEscape::Html,
         #[cfg(feature = "json")]
-        Some("json" | "js" | "yaml" | "yml") => AutoEscape::Json,
+        Some("json" | "json5" | "js" | "yaml" | "yml") => AutoEscape::Json,
         _ => AutoEscape::None,
     }
 }
@@ -51,8 +54,9 @@ pub fn escape_formatter(out: &mut Output, state: &State, value: &Value) -> Resul
 pub(crate) fn get_builtin_filters() -> BTreeMap<Cow<'static, str>, filters::BoxedFilter> {
     let mut rv = BTreeMap::new();
     rv.insert("safe".into(), BoxedFilter::new(filters::safe));
-    rv.insert("escape".into(), BoxedFilter::new(filters::escape));
-    rv.insert("e".into(), BoxedFilter::new(filters::escape));
+    let escape = BoxedFilter::new(filters::escape);
+    rv.insert("escape".into(), escape.clone());
+    rv.insert("e".into(), escape);
     #[cfg(feature = "builtins")]
     {
         rv.insert("lower".into(), BoxedFilter::new(filters::lower));
@@ -60,8 +64,9 @@ pub(crate) fn get_builtin_filters() -> BTreeMap<Cow<'static, str>, filters::Boxe
         rv.insert("title".into(), BoxedFilter::new(filters::title));
         rv.insert("capitalize".into(), BoxedFilter::new(filters::capitalize));
         rv.insert("replace".into(), BoxedFilter::new(filters::replace));
-        rv.insert("length".into(), BoxedFilter::new(filters::length));
-        rv.insert("count".into(), BoxedFilter::new(filters::length));
+        let length = BoxedFilter::new(filters::length);
+        rv.insert("length".into(), length.clone());
+        rv.insert("count".into(), length);
         rv.insert("dictsort".into(), BoxedFilter::new(filters::dictsort));
         rv.insert("items".into(), BoxedFilter::new(filters::items));
         rv.insert("reverse".into(), BoxedFilter::new(filters::reverse));
@@ -70,6 +75,8 @@ pub(crate) fn get_builtin_filters() -> BTreeMap<Cow<'static, str>, filters::Boxe
         rv.insert("default".into(), BoxedFilter::new(filters::default));
         rv.insert("round".into(), BoxedFilter::new(filters::round));
         rv.insert("abs".into(), BoxedFilter::new(filters::abs));
+        rv.insert("int".into(), BoxedFilter::new(filters::int));
+        rv.insert("float".into(), BoxedFilter::new(filters::float));
         rv.insert("attr".into(), BoxedFilter::new(filters::attr));
         rv.insert("first".into(), BoxedFilter::new(filters::first));
         rv.insert("last".into(), BoxedFilter::new(filters::last));
@@ -87,6 +94,8 @@ pub(crate) fn get_builtin_filters() -> BTreeMap<Cow<'static, str>, filters::Boxe
         rv.insert("selectattr".into(), BoxedFilter::new(filters::selectattr));
         rv.insert("rejectattr".into(), BoxedFilter::new(filters::rejectattr));
         rv.insert("map".into(), BoxedFilter::new(filters::map));
+        rv.insert("unique".into(), BoxedFilter::new(filters::unique));
+        rv.insert("pprint".into(), BoxedFilter::new(filters::pprint));
         rv.insert("split".into(), BoxedFilter::new(filters::split));
         rv.insert("contains".into(), BoxedFilter::new(filters::contains));
         #[cfg(feature = "time_format")]
@@ -117,13 +126,17 @@ pub(crate) fn get_builtin_tests() -> BTreeMap<Cow<'static, str>, BoxedTest> {
     rv.insert("undefined".into(), BoxedTest::new(tests::is_undefined));
     rv.insert("defined".into(), BoxedTest::new(tests::is_defined));
     rv.insert("none".into(), BoxedTest::new(tests::is_none));
-    rv.insert("safe".into(), BoxedTest::new(tests::is_safe));
-    rv.insert("escaped".into(), BoxedTest::new(tests::is_safe));
+    let is_safe = BoxedTest::new(tests::is_safe);
+    rv.insert("safe".into(), is_safe.clone());
+    rv.insert("escaped".into(), is_safe);
     #[cfg(feature = "builtins")]
     {
         rv.insert("odd".into(), BoxedTest::new(tests::is_odd));
         rv.insert("even".into(), BoxedTest::new(tests::is_even));
         rv.insert("number".into(), BoxedTest::new(tests::is_number));
+        rv.insert("integer".into(), BoxedTest::new(tests::is_integer));
+        rv.insert("int".into(), BoxedTest::new(tests::is_integer));
+        rv.insert("float".into(), BoxedTest::new(tests::is_float));
         rv.insert("string".into(), BoxedTest::new(tests::is_string));
         rv.insert("sequence".into(), BoxedTest::new(tests::is_sequence));
         rv.insert("mapping".into(), BoxedTest::new(tests::is_mapping));
@@ -134,22 +147,32 @@ pub(crate) fn get_builtin_tests() -> BTreeMap<Cow<'static, str>, BoxedTest> {
         rv.insert("endingwith".into(), BoxedTest::new(tests::is_endingwith));
 
         // operators
-        rv.insert("eq".into(), BoxedTest::new(tests::is_eq));
-        rv.insert("equalto".into(), BoxedTest::new(tests::is_eq));
-        rv.insert("==".into(), BoxedTest::new(tests::is_eq));
-        rv.insert("ne".into(), BoxedTest::new(tests::is_ne));
-        rv.insert("!=".into(), BoxedTest::new(tests::is_ne));
-        rv.insert("lt".into(), BoxedTest::new(tests::is_lt));
-        rv.insert("lessthan".into(), BoxedTest::new(tests::is_lt));
-        rv.insert("<".into(), BoxedTest::new(tests::is_lt));
-        rv.insert("le".into(), BoxedTest::new(tests::is_le));
-        rv.insert("<=".into(), BoxedTest::new(tests::is_le));
-        rv.insert("gt".into(), BoxedTest::new(tests::is_gt));
-        rv.insert("greaterthan".into(), BoxedTest::new(tests::is_gt));
-        rv.insert(">".into(), BoxedTest::new(tests::is_gt));
-        rv.insert("ge".into(), BoxedTest::new(tests::is_ge));
-        rv.insert(">=".into(), BoxedTest::new(tests::is_ge));
+        let is_eq = BoxedTest::new(tests::is_eq);
+        rv.insert("eq".into(), is_eq.clone());
+        rv.insert("equalto".into(), is_eq.clone());
+        rv.insert("==".into(), is_eq);
+        let is_ne = BoxedTest::new(tests::is_ne);
+        rv.insert("ne".into(), is_ne.clone());
+        rv.insert("!=".into(), is_ne);
+        let is_lt = BoxedTest::new(tests::is_lt);
+        rv.insert("lt".into(), is_lt.clone());
+        rv.insert("lessthan".into(), is_lt.clone());
+        rv.insert("<".into(), is_lt);
+        let is_le = BoxedTest::new(tests::is_le);
+        rv.insert("le".into(), is_le.clone());
+        rv.insert("<=".into(), is_le);
+        let is_gt = BoxedTest::new(tests::is_gt);
+        rv.insert("gt".into(), is_gt.clone());
+        rv.insert("greaterthan".into(), is_gt.clone());
+        rv.insert(">".into(), is_gt);
+        let is_ge = BoxedTest::new(tests::is_ge);
+        rv.insert("ge".into(), is_ge.clone());
+        rv.insert(">=".into(), is_ge);
         rv.insert("in".into(), BoxedTest::new(tests::is_in));
+        rv.insert("true".into(), BoxedTest::new(tests::is_true));
+        rv.insert("false".into(), BoxedTest::new(tests::is_false));
+        rv.insert("filter".into(), BoxedTest::new(tests::is_filter));
+        rv.insert("test".into(), BoxedTest::new(tests::is_test));
     }
     rv
 }
@@ -175,4 +198,33 @@ pub(crate) fn get_globals() -> BTreeMap<Cow<'static, str>, Value> {
     }
 
     rv
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    use similar_asserts::assert_eq;
+
+    #[test]
+    fn test_default_uto_escape() {
+        assert_eq!(default_auto_escape_callback("foo.html"), AutoEscape::Html);
+        assert_eq!(
+            default_auto_escape_callback("foo.html.j2"),
+            AutoEscape::Html
+        );
+        assert_eq!(default_auto_escape_callback("foo.htm"), AutoEscape::Html);
+        assert_eq!(default_auto_escape_callback("foo.htm.j2"), AutoEscape::Html);
+        assert_eq!(default_auto_escape_callback("foo.txt"), AutoEscape::None);
+        assert_eq!(default_auto_escape_callback("foo.txt.j2"), AutoEscape::None);
+
+        #[cfg(feature = "json")]
+        {
+            assert_eq!(default_auto_escape_callback("foo.yaml"), AutoEscape::Json);
+            assert_eq!(
+                default_auto_escape_callback("foo.json.j2"),
+                AutoEscape::Json
+            );
+        }
+    }
 }

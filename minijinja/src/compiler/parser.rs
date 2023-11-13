@@ -1,8 +1,9 @@
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::compiler::ast::{self, Spanned};
-use crate::compiler::lexer::tokenize;
+use crate::compiler::lexer::{tokenize, SyntaxConfig};
 use crate::compiler::tokens::{Span, Token};
 use crate::error::{Error, ErrorKind};
 use crate::value::Value;
@@ -11,15 +12,6 @@ const MAX_RECURSION: usize = 150;
 const RESERVED_NAMES: [&str; 8] = [
     "true", "True", "false", "False", "none", "None", "loop", "self",
 ];
-
-macro_rules! syntax_error {
-    ($msg:expr) => {{
-        return Err(Error::new(ErrorKind::SyntaxError, $msg));
-    }};
-    ($msg:expr, $($tt:tt)*) => {{
-        return Err(Error::new(ErrorKind::SyntaxError, format!($msg, $($tt)*)));
-    }};
-}
 
 fn unexpected<D: fmt::Display>(unexpected: D, expected: &str) -> Error {
     Error::new(
@@ -34,6 +26,19 @@ fn unexpected_eof(expected: &str) -> Error {
 
 fn make_const(value: Value, span: Span) -> ast::Expr<'static> {
     ast::Expr::Const(Spanned::new(ast::Const { value }, span))
+}
+
+fn syntax_error(msg: Cow<'static, str>) -> Error {
+    Error::new(ErrorKind::SyntaxError, msg)
+}
+
+macro_rules! syntax_error {
+    ($msg:expr) => {{
+        return Err(syntax_error(Cow::Borrowed($msg)));
+    }};
+    ($msg:expr, $($tt:tt)*) => {{
+        return Err(syntax_error(Cow::Owned(format!($msg, $($tt)*))));
+    }};
 }
 
 macro_rules! expect_token {
@@ -71,13 +76,13 @@ macro_rules! matches_token {
 
 macro_rules! skip_token {
     ($p:expr, $match:pat) => {
-        if matches_token!($p, $match) {
-            // we can ignore the error as matches_token! would already
-            // have created it.
-            let _ = $p.stream.next();
-            true
-        } else {
-            false
+        match $p.stream.current() {
+            Err(err) => return Err(err),
+            Ok(Some(($match, _))) => {
+                let _ = $p.stream.next();
+                true
+            }
+            _ => false,
         }
     };
 }
@@ -95,8 +100,8 @@ struct TokenStream<'a> {
 
 impl<'a> TokenStream<'a> {
     /// Tokenize a template
-    pub fn new(source: &'a str, in_expr: bool) -> TokenStream<'a> {
-        let mut iter = Box::new(tokenize(source, in_expr)) as Box<dyn Iterator<Item = _>>;
+    pub fn new(source: &'a str, in_expr: bool, syntax: SyntaxConfig) -> TokenStream<'a> {
+        let mut iter = Box::new(tokenize(source, in_expr, syntax)) as Box<dyn Iterator<Item = _>>;
         let current = iter.next();
         TokenStream {
             iter,
@@ -129,6 +134,7 @@ impl<'a> TokenStream<'a> {
     pub fn expand_span(&self, mut span: Span) -> Span {
         span.end_line = self.last_span.end_line;
         span.end_col = self.last_span.end_col;
+        span.end_offset = self.last_span.end_offset;
         span
     }
 
@@ -204,10 +210,9 @@ macro_rules! with_recursion_guard {
     ($parser:expr, $expr:expr) => {{
         $parser.depth += 1;
         if $parser.depth > MAX_RECURSION {
-            return Err(Error::new(
-                ErrorKind::SyntaxError,
+            return Err(syntax_error(Cow::Borrowed(
                 "template exceeds maximum recursion limits",
-            ));
+            )));
         }
         let rv = $expr;
         $parser.depth -= 1;
@@ -216,9 +221,9 @@ macro_rules! with_recursion_guard {
 }
 
 impl<'a> Parser<'a> {
-    pub fn new(source: &'a str, in_expr: bool) -> Parser<'a> {
+    pub fn new(source: &'a str, in_expr: bool, syntax: SyntaxConfig) -> Parser<'a> {
         Parser {
-            stream: TokenStream::new(source, in_expr),
+            stream: TokenStream::new(source, in_expr, syntax),
             in_macro: false,
             blocks: BTreeSet::new(),
             depth: 0,
@@ -381,7 +386,7 @@ impl<'a> Parser<'a> {
                             ast::GetItem {
                                 expr,
                                 subscript_expr: ok!(start.ok_or_else(|| {
-                                    Error::new(ErrorKind::SyntaxError, "empty subscript")
+                                    syntax_error(Cow::Borrowed("empty subscript"))
                                 })),
                             },
                             self.stream.expand_span(span),
@@ -491,10 +496,9 @@ impl<'a> Parser<'a> {
                     kwargs.push((var.id, ok!(self.parse_expr_noif())));
                 }
                 _ if !kwargs.is_empty() => {
-                    return Err(Error::new(
-                        ErrorKind::SyntaxError,
+                    return Err(syntax_error(Cow::Borrowed(
                         "non-keyword arg after keyword arg",
-                    ));
+                    )));
                 }
                 _ => {
                     args.push(expr);
@@ -532,6 +536,7 @@ impl<'a> Parser<'a> {
             Token::Str(val) => Ok(const_val!(val)),
             Token::String(val) => Ok(const_val!(val)),
             Token::Int(val) => Ok(const_val!(val)),
+            Token::Int128(val) => Ok(const_val!(val)),
             Token::Float(val) => Ok(const_val!(val)),
             Token::ParenOpen => self.parse_tuple_or_expression(span),
             Token::BracketOpen => self.parse_list_expr(span),
@@ -636,37 +641,37 @@ impl<'a> Parser<'a> {
             };
         }
 
-        Ok(match token {
-            Token::Ident("for") => ast::Stmt::ForLoop(respan!(ok!(self.parse_for_stmt()))),
-            Token::Ident("if") => ast::Stmt::IfCond(respan!(ok!(self.parse_if_cond()))),
-            Token::Ident("with") => ast::Stmt::WithBlock(respan!(ok!(self.parse_with_block()))),
-            Token::Ident("set") => match ok!(self.parse_set()) {
+        let ident = match token {
+            Token::Ident(ident) => ident,
+            token => syntax_error!("unknown {}, expected statement", token),
+        };
+
+        Ok(match ident {
+            "for" => ast::Stmt::ForLoop(respan!(ok!(self.parse_for_stmt()))),
+            "if" => ast::Stmt::IfCond(respan!(ok!(self.parse_if_cond()))),
+            "with" => ast::Stmt::WithBlock(respan!(ok!(self.parse_with_block()))),
+            "set" => match ok!(self.parse_set()) {
                 SetParseResult::Set(rv) => ast::Stmt::Set(respan!(rv)),
                 SetParseResult::SetBlock(rv) => ast::Stmt::SetBlock(respan!(rv)),
             },
-            Token::Ident("autoescape") => {
-                ast::Stmt::AutoEscape(respan!(ok!(self.parse_auto_escape())))
-            }
-            Token::Ident("filter") => {
-                ast::Stmt::FilterBlock(respan!(ok!(self.parse_filter_block())))
-            }
-            #[cfg(feature = "multi-template")]
-            Token::Ident("block") => ast::Stmt::Block(respan!(ok!(self.parse_block()))),
-            #[cfg(feature = "multi-template")]
-            Token::Ident("extends") => ast::Stmt::Extends(respan!(ok!(self.parse_extends()))),
-            #[cfg(feature = "multi-template")]
-            Token::Ident("include") => ast::Stmt::Include(respan!(ok!(self.parse_include()))),
-            #[cfg(feature = "multi-template")]
-            Token::Ident("import") => ast::Stmt::Import(respan!(ok!(self.parse_import()))),
-            #[cfg(feature = "multi-template")]
-            Token::Ident("from") => ast::Stmt::FromImport(respan!(ok!(self.parse_from_import()))),
+            "autoescape" => ast::Stmt::AutoEscape(respan!(ok!(self.parse_auto_escape()))),
+            "filter" => ast::Stmt::FilterBlock(respan!(ok!(self.parse_filter_block()))),
+            #[cfg(feature = "multi_template")]
+            "block" => ast::Stmt::Block(respan!(ok!(self.parse_block()))),
+            #[cfg(feature = "multi_template")]
+            "extends" => ast::Stmt::Extends(respan!(ok!(self.parse_extends()))),
+            #[cfg(feature = "multi_template")]
+            "include" => ast::Stmt::Include(respan!(ok!(self.parse_include()))),
+            #[cfg(feature = "multi_template")]
+            "import" => ast::Stmt::Import(respan!(ok!(self.parse_import()))),
+            #[cfg(feature = "multi_template")]
+            "from" => ast::Stmt::FromImport(respan!(ok!(self.parse_from_import()))),
             #[cfg(feature = "macros")]
-            Token::Ident("macro") => ast::Stmt::Macro(respan!(ok!(self.parse_macro()))),
+            "macro" => ast::Stmt::Macro(respan!(ok!(self.parse_macro()))),
             #[cfg(feature = "macros")]
-            Token::Ident("call") => ast::Stmt::CallBlock(respan!(ok!(self.parse_call_block()))),
-            Token::Ident("do") => ast::Stmt::Do(respan!(ok!(self.parse_do()))),
-            Token::Ident(name) => syntax_error!("unknown statement {}", name),
-            token => syntax_error!("unknown {}, expected statement", token),
+            "call" => ast::Stmt::CallBlock(respan!(ok!(self.parse_call_block()))),
+            "do" => ast::Stmt::Do(respan!(ok!(self.parse_do()))),
+            name => syntax_error!("unknown statement {}", name),
         })
     }
 
@@ -827,7 +832,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    #[cfg(feature = "multi-template")]
+    #[cfg(feature = "multi_template")]
     fn parse_block(&mut self) -> Result<ast::Block<'a>, Error> {
         if self.in_macro {
             syntax_error!("block tags in macros are not allowed");
@@ -885,7 +890,7 @@ impl<'a> Parser<'a> {
             )));
         }
 
-        filter.ok_or_else(|| Error::new(ErrorKind::SyntaxError, "expected a filter"))
+        filter.ok_or_else(|| syntax_error(Cow::Borrowed("expected a filter")))
     }
 
     fn parse_filter_block(&mut self) -> Result<ast::FilterBlock<'a>, Error> {
@@ -896,17 +901,27 @@ impl<'a> Parser<'a> {
         Ok(ast::FilterBlock { filter, body })
     }
 
-    #[cfg(feature = "multi-template")]
+    #[cfg(feature = "multi_template")]
     fn parse_extends(&mut self) -> Result<ast::Extends<'a>, Error> {
         let name = ok!(self.parse_expr());
         Ok(ast::Extends { name })
     }
 
-    #[cfg(feature = "multi-template")]
+    #[cfg(feature = "multi_template")]
     fn parse_include(&mut self) -> Result<ast::Include<'a>, Error> {
         let name = ok!(self.parse_expr());
+
+        // with/without context is without meaning in MiniJinja, but for syntax
+        // compatibility it's supported.
+        if skip_token!(self, Token::Ident("without" | "with")) {
+            expect_token!(self, Token::Ident("context"), "missing keyword");
+        }
+
         let ignore_missing = if skip_token!(self, Token::Ident("ignore")) {
             expect_token!(self, Token::Ident("missing"), "missing keyword");
+            if skip_token!(self, Token::Ident("without" | "with")) {
+                expect_token!(self, Token::Ident("context"), "missing keyword");
+            }
             true
         } else {
             false
@@ -917,7 +932,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    #[cfg(feature = "multi-template")]
+    #[cfg(feature = "multi_template")]
     fn parse_import(&mut self) -> Result<ast::Import<'a>, Error> {
         let expr = ok!(self.parse_expr());
         expect_token!(self, Token::Ident("as"), "as");
@@ -925,7 +940,7 @@ impl<'a> Parser<'a> {
         Ok(ast::Import { expr, name })
     }
 
-    #[cfg(feature = "multi-template")]
+    #[cfg(feature = "multi_template")]
     fn parse_from_import(&mut self) -> Result<ast::FromImport<'a>, Error> {
         let expr = ok!(self.parse_expr());
         let mut names = Vec::new();
@@ -1091,20 +1106,33 @@ impl<'a> Parser<'a> {
 }
 
 /// Parses a template
+#[cfg(feature = "unstable_machinery")]
 pub fn parse<'source>(source: &'source str, filename: &str) -> Result<ast::Stmt<'source>, Error> {
+    parse_with_syntax(source, filename, Default::default(), false)
+}
+
+/// Parses a template with a specific syntax
+pub fn parse_with_syntax<'source>(
+    source: &'source str,
+    filename: &str,
+    syntax: SyntaxConfig,
+    keep_trailing_newline: bool,
+) -> Result<ast::Stmt<'source>, Error> {
     // we want to chop off a single newline at the end.  This means that a template
     // by default does not end in a newline which is a useful property to allow
     // inline templates to work.  If someone wants a trailing newline the expectation
     // is that the user adds it themselves for achieve consistency.
     let mut source = source;
-    if source.ends_with('\n') {
-        source = &source[..source.len() - 1];
-    }
-    if source.ends_with('\r') {
-        source = &source[..source.len() - 1];
+    if !keep_trailing_newline {
+        if source.ends_with('\n') {
+            source = &source[..source.len() - 1];
+        }
+        if source.ends_with('\r') {
+            source = &source[..source.len() - 1];
+        }
     }
 
-    let mut parser = Parser::new(source, false);
+    let mut parser = Parser::new(source, false, syntax);
     parser.parse().map_err(|mut err| {
         if err.line().is_none() {
             err.set_filename_and_span(filename, parser.stream.last_span())
@@ -1114,8 +1142,8 @@ pub fn parse<'source>(source: &'source str, filename: &str) -> Result<ast::Stmt<
 }
 
 /// Parses an expression
-pub fn parse_expr(source: &str) -> Result<ast::Expr<'_>, Error> {
-    let mut parser = Parser::new(source, true);
+pub fn parse_expr(source: &str, syntax: SyntaxConfig) -> Result<ast::Expr<'_>, Error> {
+    let mut parser = Parser::new(source, true, syntax);
     parser
         .parse_expr()
         .and_then(|result| {

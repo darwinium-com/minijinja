@@ -1,6 +1,6 @@
 ---
 source: minijinja/tests/test_templates.rs
-description: "{% with f = range %}{% for x in f(upper) %}{{ debug() }}{% endfor %}{% endwith %}"
+description: "{% with f = range %}{% for x in f(upper) %}{{ debug() }}{% endfor %}{% endwith %}\n---\n{{ debug(none) }}\n---\n{{ debug(true, false, 42) }}\n---\n{{ debug([debug, 42]) }}"
 info:
   upper: 1
 input_file: minijinja/tests/inputs/debug.txt
@@ -8,9 +8,6 @@ input_file: minijinja/tests/inputs/debug.txt
 State {
     name: "debug.txt",
     current_block: None,
-    current_call: Some(
-        "debug",
-    ),
     auto_escape: None,
     ctx: {
         "x": 0,
@@ -24,8 +21,8 @@ State {
             last: true,
             depth: 1,
             depth0: 0,
-            previtem: Undefined,
-            nextitem: Undefined,
+            previtem: undefined,
+            nextitem: undefined,
         },
         "f": minijinja::functions::builtins::range,
         "upper": 1,
@@ -49,10 +46,15 @@ State {
             "equalto",
             "escaped",
             "even",
+            "false",
+            "filter",
+            "float",
             "ge",
             "greaterthan",
             "gt",
             "in",
+            "int",
+            "integer",
             "le",
             "lessthan",
             "lt",
@@ -65,6 +67,8 @@ State {
             "sequence",
             "startingwith",
             "string",
+            "test",
+            "true",
             "undefined",
         ],
         filters: [
@@ -80,7 +84,9 @@ State {
             "e",
             "escape",
             "first",
+            "float",
             "indent",
+            "int",
             "items",
             "join",
             "last",
@@ -90,6 +96,7 @@ State {
             "map",
             "max",
             "min",
+            "pprint",
             "reject",
             "rejectattr",
             "replace",
@@ -103,6 +110,7 @@ State {
             "title",
             "tojson",
             "trim",
+            "unique",
             "upper",
             "urlencode",
         ],
@@ -125,4 +133,17 @@ State {
         ],
     },
 }
+---
+none
+---
+[
+    true,
+    false,
+    42,
+]
+---
+[
+    minijinja::functions::builtins::debug,
+    42,
+]
 

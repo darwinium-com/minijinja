@@ -25,7 +25,7 @@ ecosystem of editor integrations.
 ```
 $ cargo tree
 minimal v0.1.0 (examples/minimal)
-└── minijinja v0.30.4 (minijinja)
+└── minijinja v1.0.10 (minijinja)
     └── serde v1.0.144
 ```
 
@@ -37,13 +37,15 @@ powered by a WASM build of MiniJinja.
 * [Well documented](https://docs.rs/minijinja), compact API
 * Minimal dependencies, reasonable compile times and [decent runtime performance](https://github.com/mitsuhiko/minijinja/tree/main/benchmarks#comparison-results)
 * [Stay close as possible](https://github.com/mitsuhiko/minijinja/blob/main/COMPATIBILITY.md) to Jinja2
-* Support for [expression evaluation](https://docs.rs/minijinja/latest/minijinja/struct.Expression.html)
+* Support for [expression evaluation](https://docs.rs/minijinja/latest/minijinja/struct.Expression.html) which
+  allows the use [as a DSL](https://github.com/mitsuhiko/minijinja/tree/main/examples/dsl)
 * Support for all [`serde`](https://serde.rs) compatible types
 * [Well tested](https://github.com/mitsuhiko/minijinja/tree/main/minijinja/tests)
 * Support for [dynamic runtime objects](https://docs.rs/minijinja/latest/minijinja/value/trait.Object.html) with methods and dynamic attributes
 * [Descriptive errors](https://github.com/mitsuhiko/minijinja/tree/main/examples/error)
 * [Compiles to WebAssembly](https://github.com/mitsuhiko/minijinja-playground/blob/main/src/lib.rs)
 * [Works with Python](https://github.com/mitsuhiko/minijinja/tree/main/minijinja-py)
+* Comes with a handy [CLI](https://github.com/mitsuhiko/minijinja/tree/main/minijinja-cli)
 
 ## Example Template
 
@@ -72,19 +74,12 @@ fn main() {
 If you are stuck with `MiniJinja`, have suggestions or need help, you can use the
 [GitHub Discussions](https://github.com/mitsuhiko/minijinja/discussions).
 
-## Minimum Rust Version
-
-MiniJinja's development version requires Rust 1.61 due to limitations with
-HRTBs in older Rust versions.
-
-MiniJinja 0.20 supports Rust versions down to 1.45.  It is possible to write
-code that is compatible with both 0.20 and newer versions of MiniJinja which
-should make it possible to defer the upgrade to later.
-
 ## Related Crates
 
 * [minijinja-autoreload](https://github.com/mitsuhiko/minijinja/tree/main/minijinja-autoreload): provides
   auto reloading functionality of environments
+* [minijinja-contrib](https://github.com/mitsuhiko/minijinja/tree/main/minijinja-contrib): provides
+  additional utilities too specific for the core
 * [minijinja-stack-ref](https://github.com/mitsuhiko/minijinja/tree/main/minijinja-stack-ref): provides
   functionality to pass values from the stack
 * [minijinja-py](https://github.com/mitsuhiko/minijinja/tree/main/minijinja-py): makes MiniJinja

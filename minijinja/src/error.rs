@@ -70,7 +70,7 @@ impl fmt::Debug for Error {
         }
         ok!(err.finish());
 
-        // so this is a bit questionablem, but because of how commonly errors are just
+        // so this is a bit questionable, but because of how commonly errors are just
         // unwrapped i think it's sensible to spit out the debug info following the
         // error struct dump.
         #[cfg(feature = "debug")]
@@ -97,6 +97,7 @@ impl fmt::Debug for Error {
 
 /// An enum describing the error kind.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ErrorKind {
     /// A non primitive value was encountered where one was expected.
     NonPrimitive,
@@ -126,6 +127,9 @@ pub enum ErrorKind {
     UndefinedError,
     /// Not able to serialize this value.
     BadSerialization,
+    /// Not able to deserialize this value.
+    #[cfg(feature = "deserialization")]
+    CannotDeserialize,
     /// An error happened in an include.
     BadInclude,
     /// An error happened in a super block.
@@ -137,6 +141,12 @@ pub enum ErrorKind {
     /// Engine ran out of fuel
     #[cfg(feature = "fuel")]
     OutOfFuel,
+    #[cfg(feature = "custom_syntax")]
+    /// Error creating aho-corasick delimiters
+    InvalidDelimiter,
+    /// An unknown block was called
+    #[cfg(feature = "multi_template")]
+    UnknownBlock,
 }
 
 impl ErrorKind {
@@ -155,13 +165,19 @@ impl ErrorKind {
             ErrorKind::UnknownMethod => "unknown method",
             ErrorKind::BadEscape => "bad string escape",
             ErrorKind::UndefinedError => "undefined value",
-            ErrorKind::BadSerialization => "could not serialize to internal format",
+            ErrorKind::BadSerialization => "could not serialize to value",
             ErrorKind::BadInclude => "could not render include",
             ErrorKind::EvalBlock => "could not render block",
             ErrorKind::CannotUnpack => "cannot unpack",
             ErrorKind::WriteFailure => "failed to write output",
+            #[cfg(feature = "deserialization")]
+            ErrorKind::CannotDeserialize => "cannot deserialize",
             #[cfg(feature = "fuel")]
             ErrorKind::OutOfFuel => "engine ran out of fuel",
+            #[cfg(feature = "custom_syntax")]
+            ErrorKind::InvalidDelimiter => "invalid custom delimiters",
+            #[cfg(feature = "multi_template")]
+            ErrorKind::UnknownBlock => "unknown block",
         }
     }
 }
@@ -226,7 +242,7 @@ impl Error {
     pub(crate) fn set_filename_and_span(&mut self, filename: &str, span: Span) {
         self.repr.name = Some(filename.into());
         self.repr.span = Some(span);
-        self.repr.lineno = span.start_line;
+        self.repr.lineno = span.start_line as usize;
     }
 
     pub(crate) fn new_not_found(name: &str) -> Error {
@@ -248,6 +264,19 @@ impl Error {
         self.repr.kind
     }
 
+    /// Returns the error detail
+    ///
+    /// The detail is an error message that provides further details about
+    /// the error kind.
+    pub fn detail(&self) -> Option<&str> {
+        self.repr.detail.as_deref()
+    }
+
+    /// Overrides the detail.
+    pub(crate) fn set_detail<D: Into<Cow<'static, str>>>(&mut self, d: D) {
+        self.repr.detail = Some(d.into());
+    }
+
     /// Returns the filename of the template that caused the error.
     pub fn name(&self) -> Option<&str> {
         self.repr.name.as_deref()
@@ -262,6 +291,41 @@ impl Error {
         }
     }
 
+    /// Returns the byte range of where the error occurred if available.
+    ///
+    /// In combination with [`template_source`](Self::template_source) this can be
+    /// used to better visualize where the error is coming from.  By indexing into
+    /// the template source one ends up with the source of the failing expression.
+    ///
+    /// Note that debug mode ([`Environment::set_debug`](crate::Environment::set_debug))
+    /// needs to be enabled, and the `debug` feature must be turned on.  The engine
+    /// usually keeps track of spans in all cases, but there is no absolute guarantee
+    /// that it is able to provide a range in all error cases.
+    ///
+    /// ```
+    /// # use minijinja::{Error, Environment, context};
+    /// # let mut env = Environment::new();
+    /// # env.set_debug(true);
+    /// let tmpl = env.template_from_str("Hello {{ foo + bar }}!").unwrap();
+    /// let err = tmpl.render(context!(foo => "a string", bar => 0)).unwrap_err();
+    /// let src = err.template_source().unwrap();
+    /// assert_eq!(&src[err.range().unwrap()], "foo + bar");
+    /// ```
+    #[cfg(feature = "debug")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "debug")))]
+    pub fn range(&self) -> Option<std::ops::Range<usize>> {
+        self.repr
+            .span
+            .map(|x| x.start_offset as usize..x.end_offset as usize)
+    }
+
+    /// Returns the template source if available.
+    #[cfg(feature = "debug")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "debug")))]
+    pub fn template_source(&self) -> Option<&str> {
+        self.debug_info().and_then(|x| x.source())
+    }
+
     /// Returns the line number where the error occurred.
     #[cfg(feature = "debug")]
     pub(crate) fn span(&self) -> Option<Span> {
@@ -274,7 +338,6 @@ impl Error {
     /// mode is enabled on the environment
     /// ([`Environment::set_debug`](crate::Environment::set_debug)).
     #[cfg(feature = "debug")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "debug")))]
     pub(crate) fn debug_info(&self) -> Option<&crate::debug::DebugInfo> {
         self.repr.debug_info.as_ref()
     }
@@ -312,16 +375,6 @@ impl From<ErrorKind> for Error {
 impl From<fmt::Error> for Error {
     fn from(_: fmt::Error) -> Self {
         Error::new(ErrorKind::WriteFailure, "formatting failed")
-    }
-}
-
-#[cfg(feature = "serde")]
-impl serde::ser::Error for Error {
-    fn custom<T>(msg: T) -> Self
-    where
-        T: fmt::Display,
-    {
-        Error::new(ErrorKind::BadSerialization, msg.to_string())
     }
 }
 

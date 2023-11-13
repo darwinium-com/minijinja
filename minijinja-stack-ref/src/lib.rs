@@ -13,9 +13,8 @@
 //! This crate provides a solution to this issue by moving lifetime checks to the
 //! runtime for MiniJinja objects.  One first needs to create a [`Scope`] with
 //! the [`scope`] function.  It invokes a callback to which a scope is passed
-//! which in turn then provides functionality to create
-//! [`Value`](minijinja::value::Value)s to those borrowed values such as the
-//! [`object_ref`](crate::Scope::object_ref) method.
+//! which in turn then provides functionality to create [`Value`]s to those
+//! borrowed values such as the [`object_ref`](crate::Scope::object_ref) method.
 //!
 //! # Example
 //!
@@ -338,7 +337,7 @@ impl<T: StructObject + Send + Sync + 'static + ?Sized> StructObject for StackHan
         self.with(|val| val.static_fields())
     }
 
-    fn fields(&self) -> Vec<Arc<String>> {
+    fn fields(&self) -> Vec<Arc<str>> {
         self.with(|val| val.fields())
     }
 
@@ -413,7 +412,7 @@ impl<T: Object + ?Sized> StructObject for StackHandleProxy<T> {
             .with(|val| unwrap_kind!(val, ObjectKind::Struct).get_field(name))
     }
 
-    fn fields(&self) -> Vec<Arc<String>> {
+    fn fields(&self) -> Vec<Arc<str>> {
         self.0
             .with(|val| unwrap_kind!(val, ObjectKind::Struct).fields())
     }

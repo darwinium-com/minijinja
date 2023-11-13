@@ -79,7 +79,12 @@ pub trait Object: fmt::Display + fmt::Debug + Any + Sync + Send {
 impl dyn Object {
     /// Returns some reference to the boxed object if it is of type `T`, or None if it isn’t.
     ///
-    /// This is basically the "reverse" of [`from_object`](Value::from_object).
+    /// This is basically the "reverse" of [`from_object`](Value::from_object),
+    /// [`from_seq_object`](Value::from_seq_object) and [`from_struct_object`](Value::from_struct_object).
+    ///
+    /// Because this method works also for objects that only implement [`StructObject`]
+    /// and [`SeqObject`] these methods do not actually use trait bounds that are
+    /// restricted to `Object`.
     ///
     /// # Example
     ///
@@ -105,16 +110,55 @@ impl dyn Object {
     /// let thing = value_as_obj.downcast_ref::<Thing>().unwrap();
     /// assert_eq!(thing.id, 42);
     /// ```
-    pub fn downcast_ref<T: Object>(&self) -> Option<&T> {
-        self.is::<T>().then(|| {
-            // SAFETY: `is` ensures this type cast is correct
-            unsafe { &*(self as *const dyn Object as *const T) }
-        })
+    ///
+    /// It also works with [`SeqObject`] or [`StructObject`]:
+    ///
+    /// ```rust
+    /// # use minijinja::value::{Value, SeqObject};
+    ///
+    /// struct Thing {
+    ///     id: usize,
+    /// }
+    ///
+    /// impl SeqObject for Thing {
+    ///     fn get_item(&self, idx: usize) -> Option<Value> {
+    ///         (idx < 3).then(|| Value::from(idx))
+    ///     }
+    ///     fn item_count(&self) -> usize {
+    ///         3
+    ///     }
+    /// }
+    ///
+    /// let x_value = Value::from_seq_object(Thing { id: 42 });
+    /// let value_as_obj = x_value.as_object().unwrap();
+    /// let thing = value_as_obj.downcast_ref::<Thing>().unwrap();
+    /// assert_eq!(thing.id, 42);
+    /// ```
+    pub fn downcast_ref<T: 'static>(&self) -> Option<&T> {
+        let type_id = (*self).type_id();
+        if type_id == TypeId::of::<T>() {
+            // SAFETY: type type id check ensures this type cast is correct
+            return Some(unsafe { &*(self as *const dyn Object as *const T) });
+        } else if type_id == TypeId::of::<SimpleSeqObject<T>>() {
+            // SAFETY: type type id check ensures this type cast is correct
+            let wrapper = unsafe { &*(self as *const dyn Object as *const SimpleSeqObject<T>) };
+            return Some(&wrapper.0);
+        } else if type_id == TypeId::of::<SimpleStructObject<T>>() {
+            // SAFETY: type type id check ensures this type cast is correct
+            let wrapper = unsafe { &*(self as *const dyn Object as *const SimpleStructObject<T>) };
+            return Some(&wrapper.0);
+        }
+        None
     }
 
     /// Checks if the object is of a specific type.
-    pub fn is<T: Object>(&self) -> bool {
-        (*self).type_id() == TypeId::of::<T>()
+    ///
+    /// For details of this operation see [`downcast_ref`](#method.downcast_ref).
+    pub fn is<T: 'static>(&self) -> bool {
+        let type_id = (*self).type_id();
+        type_id == TypeId::of::<T>()
+            || type_id == TypeId::of::<SimpleSeqObject<T>>()
+            || type_id == TypeId::of::<SimpleStructObject<T>>()
     }
 }
 
@@ -427,6 +471,50 @@ impl<'a> ExactSizeIterator for SeqObjectIter<'a> {}
 ///
 /// let value = Value::from_object(Point(1.0, 2.5, 3.0));
 /// ```
+///
+/// # Struct As context
+///
+/// Structs can also be used as template rendering context.  This has a lot of
+/// benefits as it means that the serialization overhead can be largely to
+/// completely avoided.  This means that even if templates take hundreds of
+/// values, MiniJinja does not spend time eagerly converting them into values.
+///
+/// Here is a very basic example of how a template can be rendered with a dynamic
+/// context.  Note that the implementation of [`fields`](Self::fields) is optional
+/// for this to work.  It's in fact not used by the engine during rendering but
+/// it is necessary for the [`debug()`](crate::functions::debug) function to be
+/// able to show which values exist in the context.
+///
+/// ```
+/// # fn main() -> Result<(), minijinja::Error> {
+/// # use minijinja::Environment;
+/// use minijinja::value::{Value, StructObject};
+///
+/// pub struct DynamicContext {
+///     magic: i32,
+/// }
+///
+/// impl StructObject for DynamicContext {
+///     fn get_field(&self, field: &str) -> Option<Value> {
+///         match field {
+///             "pid" => Some(Value::from(std::process::id())),
+///             "env" => Some(Value::from_iter(std::env::vars())),
+///             "magic" => Some(Value::from(self.magic)),
+///             _ => None,
+///         }
+///     }
+/// }
+///
+/// # let env = Environment::new();
+/// let tmpl = env.template_from_str("HOME={{ env.HOME }}; PID={{ pid }}; MAGIG={{ magic }}")?;
+/// let ctx = Value::from_struct_object(DynamicContext { magic: 42 });
+/// let rv = tmpl.render(ctx)?;
+/// # Ok(()) }
+/// ```
+///
+/// One thing of note here is that in the above example `env` would be re-created every
+/// time the template needs it.  A better implementation would cache the value after it
+/// was created first.
 pub trait StructObject: Send + Sync {
     /// Invoked by the engine to get a field of a struct.
     ///
@@ -457,11 +545,10 @@ pub trait StructObject: Send + Sync {
     /// Returns a vector of field names.
     ///
     /// This should be implemented if [`static_fields`](Self::static_fields) cannot
-    /// be implemented due to lifetime restrictions.  To avoid unnecessary
-    /// allocations of the fields themselves it's recommended to use the
-    /// [`intern`] function.  The default implementation converts the return value
-    /// of [`static_fields`](Self::static_fields) into a compatible format automatically.
-    fn fields(&self) -> Vec<Arc<String>> {
+    /// be implemented due to lifetime restrictions.  The default implementation
+    /// converts the return value of [`static_fields`](Self::static_fields) into
+    /// a compatible format automatically.
+    fn fields(&self) -> Vec<Arc<str>> {
         self.static_fields()
             .into_iter()
             .flat_map(|fields| fields.iter().copied().map(intern))
@@ -493,7 +580,7 @@ impl<T: StructObject> StructObject for Arc<T> {
     }
 
     #[inline]
-    fn fields(&self) -> Vec<Arc<String>> {
+    fn fields(&self) -> Vec<Arc<str>> {
         T::fields(self)
     }
 
@@ -515,7 +602,7 @@ impl<'a, T: StructObject + ?Sized> StructObject for &'a T {
     }
 
     #[inline]
-    fn fields(&self) -> Vec<Arc<String>> {
+    fn fields(&self) -> Vec<Arc<str>> {
         T::fields(self)
     }
 
@@ -530,14 +617,14 @@ pub struct SimpleSeqObject<T>(pub T);
 
 impl<T: SeqObject + 'static> fmt::Display for SimpleSeqObject<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        ok!(write!(f, "["));
+        ok!(f.write_str("["));
         for (idx, val) in (&self.0 as &dyn SeqObject).iter().enumerate() {
             if idx > 0 {
-                ok!(write!(f, ", "));
+                ok!(f.write_str(", "));
             }
             ok!(write!(f, "{val:?}"));
         }
-        write!(f, "]")
+        f.write_str("]")
     }
 }
 
@@ -560,15 +647,15 @@ pub struct SimpleStructObject<T>(pub T);
 
 impl<T: StructObject + 'static> fmt::Display for SimpleStructObject<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        ok!(write!(f, "{{"));
+        ok!(f.write_str("{"));
         for (idx, field) in self.0.fields().iter().enumerate() {
             if idx > 0 {
-                ok!(write!(f, ", "));
+                ok!(f.write_str(", "));
             }
             let val = self.0.get_field(field).unwrap_or(Value::UNDEFINED);
             ok!(write!(f, "{field:?}: {val:?}"));
         }
-        write!(f, "}}")
+        f.write_str("}")
     }
 }
 

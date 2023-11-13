@@ -48,9 +48,8 @@
 //! # Accessing State
 //!
 //! In some cases it can be necessary to access the execution [`State`].  Since a borrowed
-//! state implements [`ArgType`](crate::value::ArgType) it's possible to add a
-//! parameter that holds the state.  For instance the following filter appends
-//! the current template name to the string:
+//! state implements [`ArgType`] it's possible to add a parameter that holds the state.
+//! For instance the following filter appends the current template name to the string:
 //!
 //! ```
 //! # use minijinja::Environment;
@@ -72,6 +71,9 @@
 //! this module.  Note though that these functions are not to be
 //! called from Rust code as their exact interface (arguments and return types)
 //! might change from one MiniJinja version to another.
+//!
+//! Some additional filters are available in the
+//! [`minijinja-contrib`](https://crates.io/crates/minijinja-contrib) crate.
 use std::sync::Arc;
 
 use crate::error::Error;
@@ -102,7 +104,7 @@ pub(crate) struct BoxedFilter(Arc<FilterFunc>);
 /// applied to and up to 4 extra parameters.  The extra parameters can be
 /// marked optional by using `Option<T>`.  The last argument can also use
 /// [`Rest<T>`](crate::value::Rest) to capture the remaining arguments.  All
-/// types are supported for which [`ArgType`](crate::value::ArgType) is implemented.
+/// types are supported for which [`ArgType`] is implemented.
 ///
 /// For a list of built-in filters see [`filters`](crate::filters).
 ///
@@ -233,7 +235,7 @@ pub fn escape(state: &State, v: Value) -> Result<Value, Error> {
     // of the initial state and if that is also not set it falls back
     // to HTML.
     let auto_escape = match state.auto_escape() {
-        AutoEscape::None => match state.env().get_initial_auto_escape(state.name()) {
+        AutoEscape::None => match state.env().initial_auto_escape(state.name()) {
             AutoEscape::None => AutoEscape::Html,
             other => other,
         },
@@ -253,15 +255,12 @@ mod builtins {
     use super::*;
 
     use crate::error::ErrorKind;
-    use crate::key::Key;
-    use crate::value::{ValueKind, ValueRepr};
+    use crate::value::ops::as_f64;
+    use crate::value::{Kwargs, ValueKind, ValueRepr};
     use std::borrow::Cow;
     use std::cmp::Ordering;
     use std::fmt::Write;
     use std::mem;
-
-    #[cfg(test)]
-    use similar_asserts::assert_eq;
 
     /// Converts a value to uppercase.
     ///
@@ -356,23 +355,59 @@ mod builtins {
         })
     }
 
+    fn sort_helper(a: &Value, b: &Value, case_sensitive: bool) -> Ordering {
+        if !case_sensitive {
+            if let (Some(a), Some(b)) = (a.as_str(), b.as_str()) {
+                #[cfg(feature = "unicode")]
+                {
+                    return unicase::UniCase::new(a).cmp(&unicase::UniCase::new(b));
+                }
+                #[cfg(not(feature = "unicode"))]
+                {
+                    return a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase());
+                }
+            }
+        }
+        a.cmp(b)
+    }
+
     /// Dict sorting functionality.
     ///
     /// This filter works like `|items` but sorts the pairs by key first.
+    ///
+    /// The filter accepts a few keyword arguments:
+    ///
+    /// * `case_sensitive`: set to `true` to make the sorting of strings case sensitive.
+    /// * `by`: set to `"value"` to sort by value. Defaults to `"key"`.
+    /// * `reverse`: set to `true` to sort in reverse.
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn dictsort(v: Value) -> Result<Value, Error> {
+    pub fn dictsort(v: Value, kwargs: Kwargs) -> Result<Value, Error> {
         if v.kind() == ValueKind::Map {
-            let mut rv = Vec::new();
+            let mut rv = Vec::with_capacity(v.len().unwrap_or(0));
             let iter = ok!(v.try_iter());
             for key in iter {
                 let value = v.get_item(&key).unwrap_or(Value::UNDEFINED);
                 rv.push((key, value));
             }
+            let by_value = match ok!(kwargs.get("by")) {
+                None | Some("key") => false,
+                Some("value") => true,
+                Some(invalid) => {
+                    return Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        format!("invalid value '{}' for 'by' parameter", invalid),
+                    ))
+                }
+            };
+            let case_sensitive = ok!(kwargs.get::<Option<bool>>("case_sensitive")).unwrap_or(false);
             rv.sort_by(|a, b| {
-                Key::from_borrowed_value(&a.0)
-                    .unwrap()
-                    .cmp(&Key::from_borrowed_value(&b.0).unwrap())
+                let (a, b) = if by_value { (&a.1, &b.1) } else { (&a.0, &b.0) };
+                sort_helper(a, b, case_sensitive)
             });
+            if let Some(true) = ok!(kwargs.get("reverse")) {
+                rv.reverse();
+            }
+            ok!(kwargs.assert_all_used());
             Ok(Value::from(
                 rv.into_iter()
                     .map(|(k, v)| Value::from(vec![k, v]))
@@ -406,7 +441,7 @@ mod builtins {
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn items(v: Value) -> Result<Value, Error> {
         if v.kind() == ValueKind::Map {
-            let mut rv = Vec::new();
+            let mut rv = Vec::with_capacity(v.len().unwrap_or(0));
             let iter = ok!(v.try_iter());
             for key in iter {
                 let value = v.get_item(&key).unwrap_or(Value::UNDEFINED);
@@ -517,13 +552,90 @@ mod builtins {
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn abs(value: Value) -> Result<Value, Error> {
         match value.0 {
-            ValueRepr::I64(x) => Ok(Value::from(x.abs())),
-            ValueRepr::I128(x) => Ok(Value::from(x.0.abs())),
+            ValueRepr::U64(_) | ValueRepr::U128(_) => Ok(value),
+            ValueRepr::I64(x) => match x.checked_abs() {
+                Some(rv) => Ok(Value::from(rv)),
+                None => Ok(Value::from((x as i128).abs())), // this cannot overflow
+            },
+            ValueRepr::I128(x) => {
+                x.0.checked_abs()
+                    .map(Value::from)
+                    .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, "overflow on abs"))
+            }
             ValueRepr::F64(x) => Ok(Value::from(x.abs())),
             _ => Err(Error::new(
                 ErrorKind::InvalidOperation,
-                "cannot round value",
+                "cannot get absolute value",
             )),
+        }
+    }
+
+    /// Converts a value into an integer.
+    ///
+    /// ```jinja
+    /// {{ "42"|int == 42 }} -> true
+    /// ```
+    #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
+    pub fn int(value: Value) -> Result<Value, Error> {
+        match &value.0 {
+            ValueRepr::Undefined | ValueRepr::None => Ok(Value::from(0)),
+            ValueRepr::Bool(x) => Ok(Value::from(*x as u64)),
+            ValueRepr::U64(_) | ValueRepr::I64(_) | ValueRepr::U128(_) | ValueRepr::I128(_) => {
+                Ok(value)
+            }
+            ValueRepr::F64(v) => {
+                let x = *v as i128;
+                if x as f64 == *v {
+                    Ok(Value::from(x))
+                } else {
+                    Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        format!("cannot convert float {} to integer", v),
+                    ))
+                }
+            }
+            ValueRepr::String(s, _) => s
+                .parse::<i128>()
+                .map(Value::from)
+                .map_err(|err| Error::new(ErrorKind::InvalidOperation, err.to_string())),
+            ValueRepr::Bytes(_)
+            | ValueRepr::Seq(_)
+            | ValueRepr::Map(_, _)
+            | ValueRepr::Dynamic(_) => Err(Error::new(
+                ErrorKind::InvalidOperation,
+                format!("cannot convert {} to integer", value.kind()),
+            )),
+            ValueRepr::Invalid(ref x) => Err(Error::new(
+                ErrorKind::InvalidOperation,
+                format!("invalid value: {}", x),
+            )),
+        }
+    }
+
+    /// Converts a value into a float.
+    ///
+    /// ```jinja
+    /// {{ "42.5"|float == 42.5 }} -> true
+    /// ```
+    #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
+    pub fn float(value: Value) -> Result<Value, Error> {
+        match &value.0 {
+            ValueRepr::Undefined | ValueRepr::None => Ok(Value::from(0.0)),
+            ValueRepr::Bool(x) => Ok(Value::from(*x as u64 as f64)),
+            ValueRepr::String(s, _) => s
+                .parse::<f64>()
+                .map(Value::from)
+                .map_err(|err| Error::new(ErrorKind::InvalidOperation, err.to_string())),
+            ValueRepr::Invalid(ref x) => Err(Error::new(
+                ErrorKind::InvalidOperation,
+                format!("invalid value: {}", x),
+            )),
+            _ => as_f64(&value).map(Value::from).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidOperation,
+                    format!("cannot convert {} to float", value.kind()),
+                )
+            }),
         }
     }
 
@@ -553,14 +665,16 @@ mod builtins {
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn round(value: Value, precision: Option<i32>) -> Result<Value, Error> {
         match value.0 {
-            ValueRepr::I64(_) | ValueRepr::I128(_) => Ok(value),
+            ValueRepr::I64(_) | ValueRepr::I128(_) | ValueRepr::U64(_) | ValueRepr::U128(_) => {
+                Ok(value)
+            }
             ValueRepr::F64(val) => {
                 let x = 10f64.powi(precision.unwrap_or(0));
                 Ok(Value::from((x * val).round() / x))
             }
             _ => Err(Error::new(
                 ErrorKind::InvalidOperation,
-                "cannot round value",
+                format!("cannot round value ({})", value.kind()),
             )),
         }
     }
@@ -607,7 +721,7 @@ mod builtins {
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn last(value: Value) -> Result<Value, Error> {
         if let Some(s) = value.as_str() {
-            Ok(s.chars().rev().next().map_or(Value::UNDEFINED, Value::from))
+            Ok(s.chars().next_back().map_or(Value::UNDEFINED, Value::from))
         } else if let Some(seq) = value.as_seq() {
             Ok(seq.iter().last().unwrap_or(Value::UNDEFINED))
         } else {
@@ -620,37 +734,57 @@ mod builtins {
 
     /// Returns the smallest item from the list.
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn min(value: Value) -> Result<Value, Error> {
-        let iter = ok!(value.try_iter().map_err(|err| {
+    pub fn min(state: &State, value: Value) -> Result<Value, Error> {
+        let iter = ok!(state.undefined_behavior().try_iter(value).map_err(|err| {
             Error::new(ErrorKind::InvalidOperation, "cannot convert value to list").with_source(err)
         }));
-        Ok(iter
-            .min_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Less))
-            .unwrap_or(Value::UNDEFINED))
+        Ok(iter.min().unwrap_or(Value::UNDEFINED))
     }
 
     /// Returns the largest item from the list.
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn max(value: Value) -> Result<Value, Error> {
-        let iter = ok!(value.try_iter().map_err(|err| {
+    pub fn max(state: &State, value: Value) -> Result<Value, Error> {
+        let iter = ok!(state.undefined_behavior().try_iter(value).map_err(|err| {
             Error::new(ErrorKind::InvalidOperation, "cannot convert value to list").with_source(err)
         }));
-        Ok(iter
-            .max_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Less))
-            .unwrap_or(Value::UNDEFINED))
+        Ok(iter.max().unwrap_or(Value::UNDEFINED))
     }
 
     /// Returns the sorted version of the given list.
+    ///
+    /// The filter accepts a few keyword arguments:
+    ///
+    /// * `case_sensitive`: set to `true` to make the sorting of strings case sensitive.
+    /// * `attribute`: can be set to an attribute or dotted path to sort by that attribute
+    /// * `reverse`: set to `true` to sort in reverse.
+    ///
+    /// ```jinja
+    /// {{ [1, 3, 2, 4]|sort }} -> [4, 3, 2, 1]
+    /// {{ [1, 3, 2, 4]|sort(reverse=true) }} -> [1, 2, 3, 4]
+    /// # Sort users by age attribute in descending order.
+    /// {{ users|sort(attribute="age") }}
+    /// # Sort users by age attribute in ascending order.
+    /// {{ users|sort(attribute="age", reverse=true) }}
+    /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn sort(value: Value, reverse: Option<bool>) -> Result<Value, Error> {
-        let mut items = ok!(value.try_iter().map_err(|err| {
+    pub fn sort(state: &State, value: Value, kwargs: Kwargs) -> Result<Value, Error> {
+        let mut items = ok!(state.undefined_behavior().try_iter(value).map_err(|err| {
             Error::new(ErrorKind::InvalidOperation, "cannot convert value to list").with_source(err)
         }))
         .collect::<Vec<_>>();
-        items.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Less));
-        if reverse.unwrap_or(false) {
+        let case_sensitive = ok!(kwargs.get::<Option<bool>>("case_sensitive")).unwrap_or(false);
+        if let Some(attr) = ok!(kwargs.get::<Option<&str>>("attribute")) {
+            items.sort_by(|a, b| match (a.get_path(attr), b.get_path(attr)) {
+                (Ok(a), Ok(b)) => sort_helper(&a, &b, case_sensitive),
+                _ => Ordering::Equal,
+            });
+        } else {
+            items.sort_by(|a, b| sort_helper(a, b, case_sensitive))
+        }
+        if let Some(true) = ok!(kwargs.get("reverse")) {
             items.reverse();
         }
+        ok!(kwargs.assert_all_used());
         Ok(Value::from(items))
     }
 
@@ -661,8 +795,8 @@ mod builtins {
     /// string this returns the characters.  If the value is undefined
     /// an empty list is returned.
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn list(value: Value) -> Result<Value, Error> {
-        let iter = ok!(value.try_iter().map_err(|err| {
+    pub fn list(state: &State, value: Value) -> Result<Value, Error> {
+        let iter = ok!(state.undefined_behavior().try_iter(value).map_err(|err| {
             Error::new(ErrorKind::InvalidOperation, "cannot convert value to list").with_source(err)
         }));
         Ok(Value::from(iter.collect::<Vec<_>>()))
@@ -698,16 +832,21 @@ mod builtins {
     /// If you pass it a second argument it’s used to fill missing values on the
     /// last iteration.
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn slice(value: Value, count: usize, fill_with: Option<Value>) -> Result<Value, Error> {
+    pub fn slice(
+        state: &State,
+        value: Value,
+        count: usize,
+        fill_with: Option<Value>,
+    ) -> Result<Value, Error> {
         if count == 0 {
             return Err(Error::new(ErrorKind::InvalidOperation, "count cannot be 0"));
         }
-        let items = ok!(value.try_iter_owned()).collect::<Vec<_>>();
+        let items = ok!(state.undefined_behavior().try_iter(value)).collect::<Vec<_>>();
         let len = items.len();
         let items_per_slice = len / count;
         let slices_with_extra = len % count;
         let mut offset = 0;
-        let mut rv = Vec::new();
+        let mut rv = Vec::with_capacity(count);
 
         for slice in 0..count {
             let start = offset + slice * items_per_slice;
@@ -750,11 +889,19 @@ mod builtins {
     /// </table>
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn batch(value: Value, count: usize, fill_with: Option<Value>) -> Result<Value, Error> {
-        let mut rv = Vec::new();
+    pub fn batch(
+        state: &State,
+        value: Value,
+        count: usize,
+        fill_with: Option<Value>,
+    ) -> Result<Value, Error> {
+        if count == 0 {
+            return Err(Error::new(ErrorKind::InvalidOperation, "count cannot be 0"));
+        }
+        let mut rv = Vec::with_capacity(value.len().unwrap_or(0) / count);
         let mut tmp = Vec::with_capacity(count);
 
-        for item in ok!(value.try_iter_owned()) {
+        for item in ok!(state.undefined_behavior().try_iter(value)) {
             if tmp.len() == count {
                 rv.push(Value::from(mem::replace(
                     &mut tmp,
@@ -829,9 +976,9 @@ mod builtins {
     /// ```jinja
     /// example:
     ///   config:
-    /// {{ global_conifg|indent(2) }} #does not indent first line
-    /// {{ global_config|indent(2,true) }} #indent whole Value with two spaces
-    /// {{ global_config|indent(2,true,true)}} #indent whole Value and all Blank Lines value
+    /// {{ global_conifg|indent(2) }}          # does not indent first line
+    /// {{ global_config|indent(2,true) }}     # indent whole Value with two spaces
+    /// {{ global_config|indent(2,true,true)}} # indent whole Value and all blank lines
     /// ```
     #[cfg_attr(docsrs, doc(cfg(all(feature = "builtins"))))]
     #[cfg(feature = "builtins")]
@@ -842,14 +989,17 @@ mod builtins {
         indent_blank_lines: Option<bool>,
     ) -> String {
         fn strip_trailing_newline(input: &mut String) {
-            if let Some(stripped) = input.strip_suffix(&['\r', '\n'][..]) {
-                input.truncate(stripped.len());
+            if input.ends_with('\n') {
+                input.truncate(input.len() - 1);
+            }
+            if input.ends_with('\r') {
+                input.truncate(input.len() - 1);
             }
         }
 
         strip_trailing_newline(&mut value);
-
-        let mut output: String = String::new();
+        let indent_with = " ".repeat(width);
+        let mut output = String::new();
         let mut iterator = value.split('\n');
         if !indent_first_line.unwrap_or(false) {
             output.push_str(iterator.next().unwrap());
@@ -858,10 +1008,10 @@ mod builtins {
         for line in iterator {
             if line.is_empty() {
                 if indent_blank_lines.unwrap_or(false) {
-                    output.push_str(&" ".repeat(width));
+                    output.push_str(&indent_with);
                 }
             } else {
-                output.push_str(format!("{}{}", " ".repeat(width), line).as_str());
+                write!(output, "{}{}", indent_with, line).ok();
             }
             output.push('\n');
         }
@@ -934,7 +1084,7 @@ mod builtins {
         } else {
             None
         };
-        for value in ok!(value.try_iter()) {
+        for value in ok!(state.undefined_behavior().try_iter(value)) {
             let test_value = if let Some(ref attr) = attr {
                 ok!(value.get_path(attr))
             } else {
@@ -1067,42 +1217,43 @@ mod builtins {
         value: Value,
         args: crate::value::Rest<Value>,
     ) -> Result<Vec<Value>, Error> {
-        let mut rv = Vec::new();
+        let mut rv = Vec::with_capacity(value.len().unwrap_or(0));
 
         // attribute mapping
-        if args.last().map_or(false, |x| x.is_kwargs()) {
-            let kwargs = args.last().unwrap();
-            if let Some(attr) = kwargs
-                .get_attr("attribute")
-                .ok()
-                .filter(|x| !x.is_undefined())
-            {
-                // TODO: extra arguments shouldn't be ignored
-                if args.len() > 1 {
-                    return Err(Error::new(
-                        ErrorKind::InvalidOperation,
-                        "too many arguments",
-                    ));
-                }
-                let default = kwargs.get_attr("default").ok();
-                for value in ok!(value.try_iter()) {
-                    let sub_val = match attr.as_str() {
-                        Some(path) => value.get_path(path),
-                        None => value.get_item(&attr),
-                    };
-                    rv.push(match (sub_val, &default) {
-                        (Ok(attr), _) => attr,
-                        (Err(err), None) => return Err(err),
-                        (Err(_), Some(default)) => default.clone(),
-                    });
-                }
-                return Ok(rv);
+        let (args, kwargs): (&[Value], Kwargs) = crate::value::from_args(&args)?;
+
+        if let Some(attr) = ok!(kwargs.get::<Option<Value>>("attribute")) {
+            if !args.is_empty() {
+                return Err(Error::from(ErrorKind::TooManyArguments));
             }
+            let default = if kwargs.has("default") {
+                ok!(kwargs.get::<Value>("default"))
+            } else {
+                Value::UNDEFINED
+            };
+            for value in ok!(state.undefined_behavior().try_iter(value)) {
+                let sub_val = match attr.as_str() {
+                    Some(path) => value.get_path(path),
+                    None => value.get_item(&attr),
+                };
+                rv.push(match (sub_val, &default) {
+                    (Ok(attr), _) => {
+                        if attr.is_undefined() {
+                            default.clone()
+                        } else {
+                            attr
+                        }
+                    }
+                    (Err(_), default) if !default.is_undefined() => default.clone(),
+                    (Err(err), _) => return Err(err),
+                });
+            }
+            ok!(kwargs.assert_all_used());
+            return Ok(rv);
         }
 
         // filter mapping
         let filter_name = ok!(args
-            .0
             .first()
             .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, "filter name is required")));
         let filter_name = ok!(filter_name.as_str().ok_or_else(|| {
@@ -1113,10 +1264,10 @@ mod builtins {
             .env
             .get_filter(filter_name)
             .ok_or_else(|| Error::from(ErrorKind::UnknownFilter)));
-        for value in ok!(value.try_iter()) {
+        for value in ok!(state.undefined_behavior().try_iter(value)) {
             let new_args = Some(value.clone())
                 .into_iter()
-                .chain(args.0.iter().skip(1).cloned())
+                .chain(args.iter().skip(1).cloned())
                 .collect::<Vec<_>>();
             rv.push(ok!(filter.apply_to(state, &new_args)));
         }
@@ -1244,141 +1395,134 @@ mod builtins {
         }
     }
 
-    #[test]
-    fn test_basics() {
-        fn test(a: u32, b: u32) -> Result<u32, Error> {
-            Ok(a + b)
+
+
+    /// check whether a string in a map or sequence, or a string in another string
+    ///
+    #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
+    pub fn contains(_state: &State, val: Value, item: Option<String>) -> Result<Value, Error> {
+        if val.is_undefined() || val.is_none() || item.is_none() {
+            return Ok(Value::from(false));
         }
 
-        let env = crate::Environment::new();
-        State::with_dummy(&env, |state| {
-            let bx = BoxedFilter::new(test);
-            assert_eq!(
-                bx.apply_to(state, &[Value::from(23), Value::from(42)][..])
-                    .unwrap(),
-                Value::from(65)
-            );
-        });
+        let item = Value::from(item.unwrap());
+        crate::value::ops::contains(&val, &item)
     }
 
-    #[test]
-    fn test_rest_args() {
-        fn sum(val: u32, rest: crate::value::Rest<u32>) -> u32 {
-            rest.iter().fold(val, |a, b| a + b)
+    /// Format a time (Milliseconds since Epoch) to a string according the formator
+    /// formator according rust chrono
+    #[cfg(feature = "time_format")]
+    pub fn strftime(_state: &State, val: Value, specs: String) -> Result<Value, Error> {
+        use chrono::{DateTime, NaiveDateTime, Utc};
+
+        let ftime_items = chrono::format::strftime::StrftimeItems::new(&specs);
+        if ftime_items
+            .clone()
+            .any(|spec| spec == chrono::format::Item::Error)
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidOperation,
+                format!("strftime invalid format {}", specs),
+            ));
         }
 
-        let env = crate::Environment::new();
-        State::with_dummy(&env, |state| {
-            let bx = BoxedFilter::new(sum);
-            assert_eq!(
-                bx.apply_to(
-                    state,
-                    &[
-                        Value::from(1),
-                        Value::from(2),
-                        Value::from(3),
-                        Value::from(4)
-                    ][..]
-                )
-                .unwrap(),
-                Value::from(1 + 2 + 3 + 4)
-            );
-        });
-    }
-
-    #[test]
-    fn test_optional_args() {
-        fn add(val: u32, a: u32, b: Option<u32>) -> Result<u32, Error> {
-            // ensure we really get our value as first argument
-            assert_eq!(val, 23);
-            let mut sum = val + a;
-            if let Some(b) = b {
-                sum += b;
+        let ms_since_epoch = match val.0 {
+            ValueRepr::I64(x) => x,
+            ValueRepr::U64(x) => x as i64,
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    "strftime only for value type Integer",
+                ))
             }
-            Ok(sum)
-        }
+        };
 
-        let env = crate::Environment::new();
-        State::with_dummy(&env, |state| {
-            let bx = BoxedFilter::new(add);
-            assert_eq!(
-                bx.apply_to(state, &[Value::from(23), Value::from(42)][..])
-                    .unwrap(),
-                Value::from(65)
-            );
-            assert_eq!(
-                bx.apply_to(
-                    state,
-                    &[Value::from(23), Value::from(42), Value::UNDEFINED][..]
-                )
-                .unwrap(),
-                Value::from(65)
-            );
-            assert_eq!(
-                bx.apply_to(
-                    state,
-                    &[Value::from(23), Value::from(42), Value::from(1)][..]
-                )
-                .unwrap(),
-                Value::from(66)
-            );
-        });
+        let dt = NaiveDateTime::from_timestamp(
+            ms_since_epoch / 1_000,
+            (ms_since_epoch % 1_000 * 1_000_000) as u32,
+        );
+        let utc_dt: DateTime<Utc> = DateTime::from_utc(dt, Utc);
+
+        Ok(Value::from(
+            utc_dt.format_with_items(ftime_items).to_string(),
+        ))
     }
 
-    #[test]
-    fn test_values_in_vec() {
-        fn upper(value: &str) -> String {
-            value.to_uppercase()
-        }
+    /// convert a string to base64 encoding
+    ///
+    /// ```jinja
+    /// <h1>{{ value | b64encode }}</h1>
+    /// ```
 
-        fn sum(value: Vec<i64>) -> i64 {
-            value.into_iter().sum::<i64>()
-        }
-
-        let upper = BoxedFilter::new(upper);
-        let sum = BoxedFilter::new(sum);
-
-        let env = crate::Environment::new();
-        State::with_dummy(&env, |state| {
-            assert_eq!(
-                upper
-                    .apply_to(state, &[Value::from("Hello World!")])
-                    .unwrap(),
-                Value::from("HELLO WORLD!")
-            );
-
-            assert_eq!(
-                sum.apply_to(state, &[Value::from(vec![Value::from(1), Value::from(2)])])
-                    .unwrap(),
-                Value::from(3)
-            );
-        });
+    #[cfg_attr(docsrs, doc(cfg(feature = "base64")))]
+    #[cfg(feature = "base64")]
+    pub fn b64encode(_state: &State, v: String) -> Result<String, Error> {
+        Ok(base64::encode(v.into_bytes()))
     }
 
-    #[test]
-    fn test_seq_object_borrow() {
-        fn connect(values: &dyn crate::value::SeqObject) -> String {
-            let mut rv = String::new();
-            for item in values.iter() {
-                rv.push_str(&item.to_string())
+    /// decode the base64 string
+    ///
+    /// ```jinja
+    /// <h1>{{ value | b64decode }}</h1>
+    /// ```
+    #[cfg_attr(docsrs, doc(cfg(feature = "base64")))]
+    #[cfg(feature = "base64")]
+    pub fn b64decode(_state: &State, v: Value) -> Result<String, Error> {
+        let val = match v.0 {
+            ValueRepr::String(x, _) => x,
+
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    "b64decode only for value type String",
+                ))
             }
-            rv
+        };
+
+        match base64::decode(val.as_bytes()) {
+            Ok(r) => match std::str::from_utf8(&r) {
+                Ok(r) => Ok(r.to_string()),
+                Err(_) => Ok(String::new()),
+            },
+            Err(_) => Ok(String::new()),
+        }
+    }
+
+    /// Returns a list of unique items from the given iterable.
+    ///
+    /// ```jinja
+    /// {{ ['foo', 'bar', 'foobar', 'foobar']|unique|list }}
+    ///   -> ['foo', 'bar', 'foobar']
+    /// ```
+    ///
+    /// The unique items are yielded in the same order as their first occurrence
+    /// in the iterable passed to the filter.  The filter will not detect
+    /// duplicate objects or arrays, only primitives such as strings or numbers.
+    #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
+    #[cfg(feature = "builtins")]
+    pub fn unique(values: Vec<Value>) -> Value {
+        use std::collections::BTreeSet;
+
+        let mut rv = Vec::new();
+        let mut seen = BTreeSet::new();
+
+        for item in values {
+            if !seen.contains(&item) {
+                rv.push(item.clone());
+                seen.insert(item);
+            }
         }
 
-        let connect = BoxedFilter::new(connect);
+        Value::from(rv)
+    }
 
-        let env = crate::Environment::new();
-        State::with_dummy(&env, |state| {
-            assert_eq!(
-                connect
-                    .apply_to(
-                        state,
-                        &[Value::from(vec![Value::from("HELLO"), Value::from(42)])]
-                    )
-                    .unwrap(),
-                Value::from("HELLO42")
-            );
-        });
+    /// Pretty print a variable.
+    ///
+    /// This is useful for debugging as it better shows what's inside an object.
+    #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
+    #[cfg(feature = "builtins")]
+    pub fn pprint(value: &Value) -> String {
+        format!("{:#?}", value)
     }
 }
 

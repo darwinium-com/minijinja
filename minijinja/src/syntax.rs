@@ -26,6 +26,7 @@
 //!   - [`{% do %}`](#-do-)
 //!   - [`{% autoescape %}`](#-autoescape-)
 //!   - [`{% raw %}`](#-raw-)
+//! - [Custom Delimiters](#custom-delimiters)
 //!
 //! </details>
 //!
@@ -139,7 +140,9 @@
 //!   can use positional arguments.  Additionally keyword arguments are supported
 //!   which are treated like a dict syntax.  Eg: `foo(a=1, b=2)` is the same as
 //!   `foo({"a": 1, "b": 2})`.
-//! - ``.`` / ``[]``: Get an attribute of an object.
+//! - ``.`` / ``[]``: Get an attribute of an object.  If an object does not have a specific
+//!   attribute or item then `undefined` is returned.  Accessing a property of an already
+//!   undefined value will result in an error.
 //! - ``[start:stop]`` / ``[start:stop:step]``: slices a list or string.  All three expressions
 //!   are optional (`start`, `stop`, `step`).  For instance ``"Hello World"[:5]`` will return
 //!   just `"Hello"`.  Likewise ``"Hello"[1:-1]`` will return `"ell"`.  The step component can
@@ -271,7 +274,7 @@
 //! ```
 //!
 //! **Special note:** the `previtem` and `nextitem` attributes are available by default
-//! but can be disabled by removing the `adjacent-loop-items` crate feature.  Removing
+//! but can be disabled by removing the `adjacent_loop_items` crate feature.  Removing
 //! these attributes can provide meaningful speedups for templates with a lot of loops.
 //!
 //! ## `{% if %}`
@@ -304,7 +307,7 @@
 //!
 //! ## `{% extends %}`
 //!
-//! **Feature:** `multi-template` (included by default)
+//! **Feature:** `multi_template` (included by default)
 //!
 //! The `extends` tag can be used to extend one template from another.  You can have multiple
 //! `extends` tags in a file, but only one of them may be executed at a time.  For more
@@ -389,10 +392,10 @@
 //!
 //! ## `{% include %}`
 //!
-//! **Feature:** `multi-template` (included by default)
+//! **Feature:** `multi_template` (included by default)
 //!  
 //! The `include` tag is useful to include a template and return the rendered contents of that file
-//! into the current namespace::
+//! into the current namespace:
 //!  
 //! ```jinja
 //! {% include 'header.html' %}
@@ -421,7 +424,7 @@
 //!
 //! ## `{% import %}`
 //!
-//! **Feature:** `multi-template` (included by default)
+//! **Feature:** `multi_template` (included by default)
 //!
 //! MiniJinja supports the `{% import %}` and `{% from ... import ... %}`
 //! syntax.  With it variables or macros can be included from other templates:
@@ -680,5 +683,40 @@
 //! </ul>
 //! {% endraw %}
 //! ```
+//!
+#![cfg_attr(
+    feature = "custom_syntax",
+    doc = r#"
+# Custom Delimiters
 
-// this is just for docs
+When MiniJinja has been compiled with the `custom_syntax` feature (see
+[`Syntax`](crate::Syntax)), it's possible to reconfigure the delimiters of the
+templates.  This is generally not recommended but it's useful for situations
+where Jinja templates are used to generate files with a syntax that would be
+conflicting for Jinja.  With custom delimiters it can for instance be more
+convenient to generate LaTeX files:
+
+```
+# use minijinja::{Environment, Syntax};
+let mut environment = Environment::new();
+environment.set_syntax(Syntax {
+    block_start: "\\BLOCK{".into(),
+    block_end: "}".into(),
+    variable_start: "\\VAR{".into(),
+    variable_end: "}".into(),
+    comment_start: "\\#{".into(),
+    comment_end: "}".into(),
+}).unwrap();
+```
+
+And then a template might look like this instead:
+
+```latex
+\begin{itemize}
+\BLOCK{for item in sequence}
+  \item \VAR{item}
+\BLOCK{endfor}
+\end{itemize}
+```
+"#
+)]

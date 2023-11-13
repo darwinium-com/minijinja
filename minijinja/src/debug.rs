@@ -18,7 +18,7 @@ struct VarPrinter<'x>(&'x BTreeMap<String, Value>);
 impl<'x> fmt::Debug for VarPrinter<'x> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.0.is_empty() {
-            return write!(f, "No referenced variables");
+            return f.write_str("No referenced variables");
         }
         let mut m = f.debug_struct("Referenced variables:");
         let mut vars = self.0.iter().collect::<Vec<_>>();
@@ -63,14 +63,16 @@ pub(super) fn render_debug_info(
             writeln!(f, "{:>4} | {}", idx + 1, line).unwrap();
         }
 
-        writeln!(f, "{:>4} > {}", idx + 1, lines[idx].1).unwrap();
+        if let Some(line) = lines.get(idx) {
+            writeln!(f, "{:>4} > {}", idx + 1, line.1).unwrap();
+        }
         if let Some(span) = span {
             if span.start_line == span.end_line {
                 ok!(writeln!(
                     f,
                     "     i {}{} {}",
-                    " ".repeat(span.start_col),
-                    "^".repeat(span.end_col - span.start_col),
+                    " ".repeat(span.start_col as usize),
+                    "^".repeat(span.end_col as usize - span.start_col as usize),
                     kind,
                 ));
             }

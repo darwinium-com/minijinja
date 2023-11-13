@@ -1,5 +1,9 @@
+import binascii
+import pytest
+import posixpath
+
 from _pytest.unraisableexception import catch_unraisable_exception
-from minijinja import Environment, TemplateError, safe
+from minijinja import Environment, TemplateError, safe, pass_state
 
 
 def test_expression():
@@ -31,7 +35,7 @@ def test_callable_attrs():
 
 def test_generator():
     def hmm():
-        # this implicity gets converted into a list. it's not a real iterator
+        # This implicitly gets converted into a list. It's not a real iterator.
         yield 1
         yield 2
         yield 3
@@ -108,10 +112,10 @@ def test_loader():
     assert called == ["index.html", "other.html"]
     env.loader = my_loader
     assert env.render_template("index.html") == "Hello from index.html"
-    assert called == ["index.html", "other.html", "index.html"]
+    assert called == ["index.html", "other.html"]
     env.reload()
     assert env.render_template("index.html") == "Hello from index.html"
-    assert called == ["index.html", "other.html", "index.html", "index.html"]
+    assert called == ["index.html", "other.html", "index.html"]
 
 
 def test_loader_reload():
@@ -130,6 +134,8 @@ def test_loader_reload():
 
 
 def test_autoescape():
+    assert Environment().auto_escape_callback is None
+
     def auto_escape(name):
         assert name == "foo.html"
         return "html"
@@ -138,6 +144,7 @@ def test_autoescape():
         auto_escape_callback=auto_escape,
         loader=lambda x: "Hello {{ foo }}",
     )
+    assert env.auto_escape_callback is auto_escape
 
     rv = env.render_template("foo.html", foo="<x>")
     assert rv == "Hello &lt;x&gt;"
@@ -146,6 +153,38 @@ def test_autoescape():
         rv = env.render_template("invalid.html", foo="<x>")
         assert rv == "Hello <x>"
         assert cm.unraisable[0] is AssertionError
+
+
+def test_finalizer():
+    assert Environment().finalizer is None
+
+    @pass_state
+    def my_finalizer(state, value):
+        assert state.name == "<string>"
+        if value is None:
+            return ""
+        elif isinstance(value, bytes):
+            return binascii.b2a_hex(value).decode("utf-8")
+        return NotImplemented
+
+    env = Environment(finalizer=my_finalizer)
+
+    rv = env.render_str("[{{ foo }}]")
+    assert rv == "[]"
+    rv = env.render_str("[{{ foo }}]", foo=None)
+    assert rv == "[]"
+    rv = env.render_str("[{{ foo }}]", foo="test")
+    assert rv == "[test]"
+    rv = env.render_str("[{{ foo }}]", foo=b"test")
+    assert rv == "[74657374]"
+
+    def raising_finalizer(value):
+        1 / 0
+
+    env = Environment(finalizer=raising_finalizer)
+
+    with pytest.raises(ZeroDivisionError):
+        env.render_str("{{ whatever }}")
 
 
 def test_globals():
@@ -199,5 +238,45 @@ def test_error():
         assert "1 > 1 +" in str(e)
         assert e.line == 1
         assert e.kind == "SyntaxError"
+        assert e.range == (2, 3)
+        assert e.template_source == "1 +"
+        assert "unexpected end of input" in e.detail
     else:
         assert False, "expected error"
+
+
+def test_custom_syntax():
+    env = Environment(
+        block_start_string="[%",
+        block_end_string="%]",
+        variable_start_string="{",
+        variable_end_string="}",
+        comment_start_string="/*",
+        comment_end_string="*/",
+    )
+    rv = env.render_str('[% if true %]{value}[% endif %]/* nothing */', value=42)
+    assert rv == '42'
+
+
+def test_path_join():
+    def join_path(name, parent):
+        return posixpath.join(posixpath.dirname(parent), name)
+    env = Environment(
+        path_join_callback=join_path,
+        templates={
+            "foo/bar.txt": "{% include 'baz.txt' %}",
+            "foo/baz.txt": "I am baz!",
+        }
+    )
+
+    with catch_unraisable_exception() as cm:
+        rv = env.render_template("foo/bar.txt")
+        assert rv == "I am baz!"
+        assert cm.unraisable is None
+
+
+def test_keep_trailing_newline():
+    env = Environment(keep_trailing_newline=False)
+    assert env.render_str("foo\n") == "foo"
+    env = Environment(keep_trailing_newline=True)
+    assert env.render_str("foo\n") == "foo\n"

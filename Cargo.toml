@@ -1,6 +1,7 @@
 [workspace]
-members = ["minijinja", "tools/*", "examples/*", "benchmarks", "minijinja-*"]
-exclude = ["examples/README.md", "tools/README.md"]
+members = ["minijinja", "examples/*", "benchmarks", "minijinja-*"]
+exclude = ["examples/README.md"]
+resolver = "2"
 
 [profile.release]
 debug = true

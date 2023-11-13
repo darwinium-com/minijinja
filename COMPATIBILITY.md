@@ -5,10 +5,9 @@ the state of compatibility and future direction is.
 
 ## Syntax Differences
 
-MiniJinja does not support line statements and the ability to customize the
-delimiters.  Both of those are currently intentional to better leverage
-the editor ecosystem which typically cannot deal with these reconfigured
-Jinja templates.
+MiniJinja does not support line statements and custom delimiters are an
+optional feature that is largely discouraged.  For custom delimiters the
+`custom_syntax` feature needs to be enabled.
 
 MiniJinja by default does not allow unicode identifiers.  These need to be
 turned on with the `unicode` feature to achieve parity with Jinja2.
@@ -26,7 +25,7 @@ The most significant differences are documented here:
 MiniJinja does not implement _any_ Python methods.  In particular this means
 you cannot do `x.items()` to iterate over items.  For this particular case
 both Jinja2 and MiniJinja now support `|items` for iteration instead.  Other
-methods are rareful useful and filters should be used instead.
+methods are rarely useful and filters should be used instead.
 
 ### Tuples
 

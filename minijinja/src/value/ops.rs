@@ -1,8 +1,9 @@
 use std::convert::{TryFrom, TryInto};
-use std::fmt::Write;
 
 use crate::error::{Error, ErrorKind};
-use crate::value::{Arc, ObjectKind, SeqObject, Value, ValueKind, ValueRepr};
+use crate::value::{KeyRef, ObjectKind, SeqObject, Value, ValueKind, ValueRepr};
+
+const MIN_I128_AS_POS_U128: u128 = 170141183460469231731687303715884105728;
 
 pub enum CoerceResult<'a> {
     I128(i128, i128),
@@ -10,7 +11,7 @@ pub enum CoerceResult<'a> {
     Str(&'a str, &'a str),
 }
 
-fn as_f64(value: &Value) -> Option<f64> {
+pub(crate) fn as_f64(value: &Value) -> Option<f64> {
     Some(match value.0 {
         ValueRepr::Bool(x) => x as i64 as f64,
         ValueRepr::U64(x) => x as f64,
@@ -181,7 +182,10 @@ macro_rules! math_binop {
 
 pub fn add(lhs: &Value, rhs: &Value) -> Result<Value, Error> {
     match coerce(lhs, rhs) {
-        Some(CoerceResult::I128(a, b)) => Ok(int_as_value(a.wrapping_add(b))),
+        Some(CoerceResult::I128(a, b)) => a
+            .checked_add(b)
+            .ok_or_else(|| failed_op("+", lhs, rhs))
+            .map(int_as_value),
         Some(CoerceResult::F64(a, b)) => Ok((a + b).into()),
         Some(CoerceResult::Str(a, b)) => Ok(Value::from([a, b].concat())),
         _ => Err(impossible_op("+", lhs, rhs)),
@@ -205,7 +209,9 @@ pub fn int_div(lhs: &Value, rhs: &Value) -> Result<Value, Error> {
     match coerce(lhs, rhs) {
         Some(CoerceResult::I128(a, b)) => {
             if b != 0 {
-                Ok(int_as_value(a.div_euclid(b)))
+                a.checked_div_euclid(b)
+                    .ok_or_else(|| failed_op("//", lhs, rhs))
+                    .map(int_as_value)
             } else {
                 Err(failed_op("//", lhs, rhs))
             }
@@ -234,9 +240,16 @@ pub fn neg(val: &Value) -> Result<Value, Error> {
     if val.kind() == ValueKind::Number {
         match val.0 {
             ValueRepr::F64(x) => Ok((-x).into()),
+            // special case for the largest i128 that can still be
+            // represented.
+            ValueRepr::U128(x) if x.0 == MIN_I128_AS_POS_U128 => {
+                Ok(Value::from(MIN_I128_AS_POS_U128))
+            }
             _ => {
                 if let Ok(x) = i128::try_from(val.clone()) {
-                    Ok(int_as_value(-x))
+                    x.checked_mul(-1)
+                        .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, "overflow"))
+                        .map(int_as_value)
                 } else {
                     Err(Error::from(ErrorKind::InvalidOperation))
                 }
@@ -248,21 +261,17 @@ pub fn neg(val: &Value) -> Result<Value, Error> {
 }
 
 /// Attempts a string concatenation.
-pub fn string_concat(mut left: Value, right: &Value) -> Value {
-    match left.0 {
-        // if we're a string and we have a single reference to it, we can
-        // directly append into ourselves and reconstruct the value
-        ValueRepr::String(ref mut s, _) => {
-            write!(Arc::make_mut(s), "{right}").ok();
-            left
-        }
-        // otherwise we use format! to concat the two values
-        _ => Value::from(format!("{left}{right}")),
-    }
+pub fn string_concat(left: Value, right: &Value) -> Value {
+    Value::from(format!("{left}{right}"))
 }
 
 /// Implements a containment operation on values.
 pub fn contains(container: &Value, value: &Value) -> Result<Value, Error> {
+    // Special case where if the container is undefined, it cannot hold
+    // values.  For strict containment checks the vm has a special case.
+    if container.is_undefined() {
+        return Ok(Value::from(false));
+    }
     let rv = if let Some(s) = container.as_str() {
         if let Some(s2) = value.as_str() {
             s.contains(s2)
@@ -272,11 +281,7 @@ pub fn contains(container: &Value, value: &Value) -> Result<Value, Error> {
     } else if let Some(seq) = container.as_seq() {
         seq.iter().any(|item| &item == value)
     } else if let ValueRepr::Map(ref map, _) = container.0 {
-        let key = match value.clone().try_into_key() {
-            Ok(key) => key,
-            Err(_) => return Ok(Value::from(false)),
-        };
-        map.get(&key).is_some()
+        map.get(&KeyRef::Value(value.clone())).is_some()
     } else {
         return Err(Error::new(
             ErrorKind::InvalidOperation,
@@ -286,72 +291,97 @@ pub fn contains(container: &Value, value: &Value) -> Result<Value, Error> {
     Ok(Value::from(rv))
 }
 
-#[test]
-fn test_adding() {
-    let err = add(&Value::from("a"), &Value::from(42)).unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "invalid operation: tried to use + operator on unsupported types string and number"
-    );
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    assert_eq!(
-        add(&Value::from(1), &Value::from(2)).unwrap(),
-        Value::from(3)
-    );
-    assert_eq!(
-        add(&Value::from("foo"), &Value::from("bar")).unwrap(),
-        Value::from("foobar")
-    );
-}
+    use similar_asserts::assert_eq;
 
-#[test]
-fn test_subtracting() {
-    let err = sub(&Value::from("a"), &Value::from(42)).unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "invalid operation: tried to use - operator on unsupported types string and number"
-    );
+    #[test]
+    fn test_neg() {
+        let err = neg(&Value::from(i128::MIN)).unwrap_err();
+        assert_eq!(err.to_string(), "invalid operation: overflow");
+    }
 
-    let err = sub(&Value::from("foo"), &Value::from("bar")).unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "invalid operation: tried to use - operator on unsupported types string and string"
-    );
+    #[test]
+    fn test_adding() {
+        let err = add(&Value::from("a"), &Value::from(42)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid operation: tried to use + operator on unsupported types string and number"
+        );
 
-    assert_eq!(
-        sub(&Value::from(2), &Value::from(1)).unwrap(),
-        Value::from(1)
-    );
-}
+        assert_eq!(
+            add(&Value::from(1), &Value::from(2)).unwrap(),
+            Value::from(3)
+        );
+        assert_eq!(
+            add(&Value::from("foo"), &Value::from("bar")).unwrap(),
+            Value::from("foobar")
+        );
 
-#[test]
-fn test_dividing() {
-    let err = div(&Value::from("a"), &Value::from(42)).unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "invalid operation: tried to use / operator on unsupported types string and number"
-    );
+        let err = add(&Value::from(i128::MAX), &Value::from(1)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid operation: unable to calculate 170141183460469231731687303715884105727 + 1"
+        );
+    }
 
-    let err = div(&Value::from("foo"), &Value::from("bar")).unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "invalid operation: tried to use / operator on unsupported types string and string"
-    );
+    #[test]
+    fn test_subtracting() {
+        let err = sub(&Value::from("a"), &Value::from(42)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid operation: tried to use - operator on unsupported types string and number"
+        );
 
-    assert_eq!(
-        div(&Value::from(100), &Value::from(2)).unwrap(),
-        Value::from(50.0)
-    );
-}
+        let err = sub(&Value::from("foo"), &Value::from("bar")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid operation: tried to use - operator on unsupported types string and string"
+        );
 
-#[test]
-fn test_concat() {
-    assert_eq!(
-        string_concat(Value::from("foo"), &Value::from(42)),
-        Value::from("foo42")
-    );
-    assert_eq!(
-        string_concat(Value::from(23), &Value::from(42)),
-        Value::from("2342")
-    );
+        assert_eq!(
+            sub(&Value::from(2), &Value::from(1)).unwrap(),
+            Value::from(1)
+        );
+    }
+
+    #[test]
+    fn test_dividing() {
+        let err = div(&Value::from("a"), &Value::from(42)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid operation: tried to use / operator on unsupported types string and number"
+        );
+
+        let err = div(&Value::from("foo"), &Value::from("bar")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid operation: tried to use / operator on unsupported types string and string"
+        );
+
+        assert_eq!(
+            div(&Value::from(100), &Value::from(2)).unwrap(),
+            Value::from(50.0)
+        );
+
+        let err = int_div(&Value::from(i128::MIN), &Value::from(-1i128)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid operation: unable to calculate -170141183460469231731687303715884105728 // -1"
+        );
+    }
+
+    #[test]
+    fn test_concat() {
+        assert_eq!(
+            string_concat(Value::from("foo"), &Value::from(42)),
+            Value::from("foo42")
+        );
+        assert_eq!(
+            string_concat(Value::from(23), &Value::from(42)),
+            Value::from("2342")
+        );
+    }
 }

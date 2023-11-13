@@ -54,7 +54,7 @@ print(result)
 
 ## Purpose
 
-MiniJinja attemps a certain level of compatibiliy with Jinja2, but it does not
+MiniJinja attempts a certain level of compatibility with Jinja2, but it does not
 try to achieve this at all costs.  As a result you will notice that quite a few
 templates will refuse to render with MiniJinja despite the fact that they probably
 look quite innocent.  It is however possible to write templates that render to the
@@ -71,9 +71,8 @@ loss of information.
 
 MiniJinja's Python bindings inherit the underlying behavior of how MiniJinja loads
 templates.  Templates are loaded on first use and then cached.  The templates are
-loaded via a "source" (called `loader` in MiniJinja's Python bindings).  To trigger
-a reload you can call `env.reload()` or alternatively set `env.reload_before_render`
-to `True`.
+loaded via a loader.  To trigger a reload you can call `env.reload()` or
+alternatively set `env.reload_before_render` to `True`.
 
 ```python
 def my_loader(name):
@@ -108,6 +107,26 @@ env = Environment(auto_escape_callback=lambda x: x.endswith((".html", ".foo")))
 MiniJinja uses [markupsafe](https://github.com/pallets/markupsafe) if it's available
 on the Python side.  It will honor `__html__`.
 
+## Finalizers
+
+Instead of custom formatters like in MiniJinja, you can define a finalizer instead
+which is similar to how it works in Jinja2.  It's passed a value (or optional also
+the state as first argument when `pass_state` is used) and can return a new value.
+If the special `NotImplemented` value is returned, the original value is rendered
+without any modification:
+
+```
+from minijinja import Environment
+
+def finalizer(value):
+    if value is None:
+	return ""
+    return NotImplemented
+
+env = Environment(finalizer=finalizer)
+assert env.render_str("{{ none }}") == ""
+```
+
 ## State Access
 
 Functions passed to the environment such as filters or global functions can
@@ -128,7 +147,7 @@ env.add_filter("add_a_variable", my_filter)
 ## Runtime Behavior
 
 MiniJinja uses it's own runtime model which is not matching the Python
-runtime model.  As a result there are clear gaps in beahvior between the
+runtime model.  As a result there are clear gaps in behavior between the
 two and only limited effort is made to bridge them.  For instance you will
 be able to call some methods of types, but for instance builtins such as
 dicts and lists do not expose their methods on the MiniJinja side.  This

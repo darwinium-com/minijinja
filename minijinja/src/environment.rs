@@ -4,37 +4,27 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::compiler::codegen::CodeGenerator;
+use crate::compiler::lexer::SyntaxConfig;
 use crate::compiler::parser::parse_expr;
-use crate::error::{attach_basic_debug_info, Error};
+use crate::error::{attach_basic_debug_info, Error, ErrorKind};
 use crate::expression::Expression;
 use crate::output::Output;
-use crate::template::{CompiledTemplate, Template};
-use crate::utils::{AutoEscape, BTreeMapKeysDebug};
+use crate::template::{CompiledTemplate, CompiledTemplateRef, Template};
+use crate::utils::{AutoEscape, BTreeMapKeysDebug, UndefinedBehavior};
 use crate::value::{FunctionArgs, FunctionResult, Value};
-use crate::vm::{State, Vm};
+use crate::vm::State;
 use crate::{defaults, filters, functions, tests};
-
-type TemplateMap<'source> = BTreeMap<&'source str, Arc<CompiledTemplate<'source>>>;
-
-#[derive(Clone)]
-enum Source<'source> {
-    Borrowed(TemplateMap<'source>),
-    #[cfg(feature = "source")]
-    Owned(crate::source::Source),
-}
-
-impl<'source> fmt::Debug for Source<'source> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Borrowed(tmpls) => fmt::Debug::fmt(&BTreeMapKeysDebug(tmpls), f),
-            #[cfg(feature = "source")]
-            Self::Owned(arg0) => fmt::Debug::fmt(arg0, f),
-        }
-    }
-}
 
 type AutoEscapeFunc = dyn Fn(&str) -> AutoEscape + Sync + Send;
 type FormatterFunc = dyn Fn(&mut Output, &State, &Value) -> Result<(), Error> + Sync + Send;
+type PathJoinFunc = dyn for<'s> Fn(&'s str, &'s str) -> Cow<'s, str> + Sync + Send;
+
+/// The maximum recursion in the VM.  Normally each stack frame
+/// adds one to this counter (eg: every time a frame is added).
+/// However in some situations more depth is pushed if the cost
+/// of the stack frame is higher.  Raising this above this limit
+/// requires enabling the `stacker` feature.
+const MAX_RECURSION: usize = 500;
 
 /// An abstraction that holds the engine configuration.
 ///
@@ -44,13 +34,6 @@ type FormatterFunc = dyn Fn(&mut Output, &State, &Value) -> Result<(), Error> + 
 /// The environment holds references to the source the templates were created from.
 /// This makes it very inconvenient to pass around unless the templates are static
 /// strings.
-#[cfg_attr(
-    feature = "source",
-    doc = "
-For situations where you want to load dynamic templates and share the
-environment it's recommended to turn on the `source` feature and to use the
-[`Source`](crate::source::Source) type with the environment."
-)]
 ///
 /// There are generally two ways to construct an environment:
 ///
@@ -60,16 +43,19 @@ environment it's recommended to turn on the `source` feature and to use the
 /// * [`Environment::empty`] creates a completely blank environment.
 #[derive(Clone)]
 pub struct Environment<'source> {
-    templates: Source<'source>,
+    templates: TemplateStore<'source>,
     filters: BTreeMap<Cow<'source, str>, filters::BoxedFilter>,
     tests: BTreeMap<Cow<'source, str>, tests::BoxedTest>,
-    pub(crate) globals: BTreeMap<Cow<'source, str>, Value>,
+    globals: BTreeMap<Cow<'source, str>, Value>,
     default_auto_escape: Arc<AutoEscapeFunc>,
+    path_join_callback: Option<Arc<PathJoinFunc>>,
+    undefined_behavior: UndefinedBehavior,
     formatter: Arc<FormatterFunc>,
     #[cfg(feature = "debug")]
     debug: bool,
     #[cfg(feature = "fuel")]
     fuel: Option<u64>,
+    recursion_limit: usize,
 }
 
 impl<'source> Default for Environment<'source> {
@@ -98,16 +84,19 @@ impl<'source> Environment<'source> {
     /// [`empty`](Environment::empty) method.
     pub fn new() -> Environment<'source> {
         Environment {
-            templates: Source::Borrowed(Default::default()),
+            templates: TemplateStore::default(),
             filters: defaults::get_builtin_filters(),
             tests: defaults::get_builtin_tests(),
             globals: defaults::get_globals(),
             default_auto_escape: Arc::new(defaults::default_auto_escape_callback),
+            path_join_callback: None,
+            undefined_behavior: UndefinedBehavior::default(),
             formatter: Arc::new(defaults::escape_formatter),
             #[cfg(feature = "debug")]
             debug: cfg!(debug_assertions),
             #[cfg(feature = "fuel")]
             fuel: None,
+            recursion_limit: MAX_RECURSION,
         }
     }
 
@@ -117,62 +106,168 @@ impl<'source> Environment<'source> {
     /// logic for auto escaping configured.
     pub fn empty() -> Environment<'source> {
         Environment {
-            templates: Source::Borrowed(Default::default()),
+            templates: TemplateStore::default(),
             filters: Default::default(),
             tests: Default::default(),
             globals: Default::default(),
             default_auto_escape: Arc::new(defaults::no_auto_escape),
+            path_join_callback: None,
+            undefined_behavior: UndefinedBehavior::default(),
             formatter: Arc::new(defaults::escape_formatter),
             #[cfg(feature = "debug")]
             debug: cfg!(debug_assertions),
             #[cfg(feature = "fuel")]
             fuel: None,
+            recursion_limit: MAX_RECURSION,
         }
     }
 
-    /// Loads a template from a string.
+    /// Loads a template from a string into the environment.
     ///
     /// The `name` parameter defines the name of the template which identifies
     /// it.  To look up a loaded template use the [`get_template`](Self::get_template)
     /// method.
     ///
+    /// ```
+    /// # use minijinja::Environment;
+    /// let mut env = Environment::new();
+    /// env.add_template("index.html", "Hello {{ name }}!").unwrap();
+    /// ```
+    ///
     /// Note that there are situations where the interface of this method is
-    /// too restrictive.  For instance the environment itself does not permit
-    /// any form of sensible dynamic template loading.
+    /// too restrictive as you need to hold on to the strings for the lifetime
+    /// of the environment.
     #[cfg_attr(
-        feature = "source",
-        doc = "To address this restriction use [`set_source`](Self::set_source)."
+        feature = "loader",
+        doc = "To address this restriction use [`add_template_owned`](Self::add_template_owned)."
     )]
     pub fn add_template(&mut self, name: &'source str, source: &'source str) -> Result<(), Error> {
-        match self.templates {
-            Source::Borrowed(ref mut map) => {
-                let compiled_template = ok!(CompiledTemplate::from_name_and_source(name, source));
-                map.insert(name, Arc::new(compiled_template));
-                Ok(())
-            }
-            #[cfg(feature = "source")]
-            Source::Owned(ref mut src) => src.add_template(name, source),
-        }
+        self.templates.insert(name, source)
+    }
+
+    /// Adds a template without borrowing.
+    ///
+    /// This lets you place an owned [`String`] in the environment rather than the
+    /// borrowed `&str` without having to worry about lifetimes.
+    ///
+    /// ```
+    /// # use minijinja::Environment;
+    /// let mut env = Environment::new();
+    /// env.add_template_owned("index.html".to_string(), "Hello {{ name }}!".to_string()).unwrap();
+    /// ```
+    ///
+    /// **Note**: the name is a bit of a misnomer as this API also allows to borrow too as
+    /// the parameters are actually [`Cow`].
+    #[cfg(feature = "loader")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "loader")))]
+    pub fn add_template_owned<N, S>(&mut self, name: N, source: S) -> Result<(), Error>
+    where
+        N: Into<Cow<'source, str>>,
+        S: Into<Cow<'source, str>>,
+    {
+        self.templates.insert_cow(name.into(), source.into())
+    }
+
+    /// Register a template loader as source of templates.
+    ///
+    /// When a template loader is registered, the environment gains the ability
+    /// to dynamically load templates.  The loader is invoked with the name of
+    /// the template.  If this template exists `Ok(Some(template_source))` has
+    /// to be returned, otherwise `Ok(None)`.  Once a template has been loaded
+    /// it's stored on the environment.  This means the loader is only invoked
+    /// once per template name.
+    ///
+    /// For loading templates from the file system, you can use the
+    /// [`path_loader`](crate::path_loader) function.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use minijinja::Environment;
+    /// fn create_env() -> Environment<'static> {
+    ///     let mut env = Environment::new();
+    ///     env.set_loader(|name| {
+    ///         if name == "layout.html" {
+    ///             Ok(Some("...".into()))
+    ///         } else {
+    ///             Ok(None)
+    ///         }
+    ///     });
+    ///     env
+    /// }
+    /// ```
+    #[cfg(feature = "loader")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "loader")))]
+    pub fn set_loader<F>(&mut self, f: F)
+    where
+        F: Fn(&str) -> Result<Option<String>, Error> + Send + Sync + 'static,
+    {
+        self.templates.set_loader(f);
+    }
+
+    /// Preserve the trailing newline when rendering templates.
+    ///
+    /// The default is `false`, which causes a single newline, if present, to be
+    /// stripped from the end of the template.
+    pub fn set_keep_trailing_newline(&mut self, yes: bool) {
+        self.templates.keep_trailing_newline = yes;
+    }
+
+    /// Returns the value of the trailing newline preservation flag.
+    pub fn keep_trailing_newline(&self) -> bool {
+        self.templates.keep_trailing_newline
     }
 
     /// Removes a template by name.
     pub fn remove_template(&mut self, name: &str) {
-        match self.templates {
-            Source::Borrowed(ref mut map) => {
-                map.remove(name);
-            }
-            #[cfg(feature = "source")]
-            Source::Owned(ref mut source) => {
-                source.remove_template(name);
-            }
-        }
+        self.templates.remove(name);
+    }
+
+    /// Sets a callback to join template paths.
+    ///
+    /// By default this returns the template path unchanged, but it can be used
+    /// to implement relative path resolution between templates.  The first
+    /// argument to the callback is the name of the template to be loaded, the
+    /// second argument is the parent path.
+    ///
+    /// The following example demonstrates how a basic path joining algorithm
+    /// can be implemented.
+    ///
+    /// ```
+    /// # let mut env = minijinja::Environment::new();
+    /// env.set_path_join_callback(|name, parent| {
+    ///     let mut rv = parent.split('/').collect::<Vec<_>>();
+    ///     rv.pop();
+    ///     name.split('/').for_each(|segment| match segment {
+    ///         "." => {}
+    ///         ".." => { rv.pop(); }
+    ///         _ => { rv.push(segment); }
+    ///     });
+    ///     rv.join("/").into()
+    /// });
+    /// ```
+    pub fn set_path_join_callback<F>(&mut self, f: F)
+    where
+        F: for<'s> Fn(&'s str, &'s str) -> Cow<'s, str> + Send + Sync + 'static,
+    {
+        self.path_join_callback = Some(Arc::new(f));
+    }
+
+    /// Removes all stored templates.
+    ///
+    /// This method is mainly useful when combined with a loader as it causes
+    /// the loader to "reload" templates.  By calling this method one can trigger
+    /// a reload.
+    pub fn clear_templates(&mut self) {
+        self.templates.clear();
     }
 
     /// Fetches a template by name.
     ///
     /// This requires that the template has been loaded with
     /// [`add_template`](Environment::add_template) beforehand.  If the template was
-    /// not loaded an error of kind `TemplateNotFound` is returned.
+    /// not loaded an error of kind `TemplateNotFound` is returned.  If a loaded was
+    /// added to the engine this can also dynamically load templates.
     ///
     /// ```
     /// # use minijinja::{Environment, context};
@@ -181,46 +276,58 @@ impl<'source> Environment<'source> {
     /// let tmpl = env.get_template("hello.txt").unwrap();
     /// println!("{}", tmpl.render(context!{ name => "World" }).unwrap());
     /// ```
-    pub fn get_template(&self, name: &str) -> Result<Template<'_>, Error> {
-        let compiled = match &self.templates {
-            Source::Borrowed(ref map) => {
-                ok!(map.get(name).ok_or_else(|| Error::new_not_found(name)))
-            }
-            #[cfg(feature = "source")]
-            Source::Owned(source) => ok!(source.get_compiled_template(name)),
-        };
+    pub fn get_template(&self, name: &str) -> Result<Template<'_, '_>, Error> {
+        let compiled = ok!(self.templates.get(name));
         Ok(Template::new(
             self,
-            compiled,
-            self.get_initial_auto_escape(name),
+            CompiledTemplateRef::Borrowed(compiled),
+            self.initial_auto_escape(name),
         ))
     }
 
-    /// Parses and renders a template from a string in one go.
+    /// Loads a template from a string.
     ///
-    /// In some cases you really only need a template to be rendered once from
-    /// a string and returned.  The internal name of the template is `<string>`.
+    /// In some cases you really only need to work with (eg: render) a template to be
+    /// rendered once only.
     ///
     /// ```
     /// # use minijinja::{Environment, context};
     /// let env = Environment::new();
-    /// let rv = env.render_str("Hello {{ name }}", context! { name => "World" });
+    /// let tmpl = env.template_from_named_str("template_name", "Hello {{ name }}").unwrap();
+    /// let rv = tmpl.render(context! { name => "World" });
     /// println!("{}", rv.unwrap());
     /// ```
+    pub fn template_from_named_str(
+        &self,
+        name: &'source str,
+        source: &'source str,
+    ) -> Result<Template<'_, 'source>, Error> {
+        Ok(Template::new(
+            self,
+            CompiledTemplateRef::Owned(Arc::new(ok!(CompiledTemplate::new(
+                name,
+                source,
+                self._syntax_config().clone(),
+                self.keep_trailing_newline(),
+            )))),
+            self.initial_auto_escape(name),
+        ))
+    }
+
+    /// Loads a template from a string, with name `<string>`.
     ///
-    /// **Note on values:** The [`Value`] type implements `Serialize` and can be
-    /// efficiently passed to render.  It does not undergo actual serialization.
-    #[cfg(feature = "serde")]
-    pub fn render_str<S: serde::Serialize>(&self, source: &str, ctx: S) -> Result<String, Error> {
-        // reduce total amount of code faling under mono morphization into
-        // this function, and share the rest in _eval.
-        self._render_str("<string>", source, Value::from_serializable(&ctx))
+    /// This is a shortcut to [`template_from_named_str`](Self::template_from_named_str)
+    /// with name set to `<string>`.
+    pub fn template_from_str(&self, source: &'source str) -> Result<Template<'_, 'source>, Error> {
+        self.template_from_named_str("<string>", source)
     }
 
     /// Parses and renders a template from a string in one go with name.
     ///
     /// Like [`render_str`](Self::render_str), but provide a name for the
-    /// template to be used instead of the default `<string>`.
+    /// template to be used instead of the default `<string>`.  This is an
+    /// alias for [`template_from_named_str`](Self::template_from_named_str) paired with
+    /// [`render`](Template::render).
     ///
     /// ```
     /// # use minijinja::{Environment, context};
@@ -228,7 +335,7 @@ impl<'source> Environment<'source> {
     /// let rv = env.render_named_str(
     ///     "template_name",
     ///     "Hello {{ name }}",
-    ///     context! { name => "World" }
+    ///     context!{ name => "World" }
     /// );
     /// println!("{}", rv.unwrap());
     /// ```
@@ -242,23 +349,23 @@ impl<'source> Environment<'source> {
         source: &str,
         ctx: S,
     ) -> Result<String, Error> {
-        // reduce total amount of code faling under mono morphization into
-        // this function, and share the rest in _eval.
-        self._render_str(name, source, Value::from_serializable(&ctx))
+        ok!(self.template_from_named_str(name, source)).render(ctx)
     }
 
-    fn _render_str(&self, name: &str, source: &str, root: Value) -> Result<String, Error> {
-        let compiled = ok!(CompiledTemplate::from_name_and_source(name, source));
-        let mut rv = String::with_capacity(compiled.buffer_size_hint);
-        Vm::new(self)
-            .eval(
-                &compiled.instructions,
-                root,
-                &compiled.blocks,
-                &mut Output::with_string(&mut rv),
-                self.get_initial_auto_escape(name),
-            )
-            .map(|_| rv)
+    /// Parses and renders a template from a string in one go.
+    ///
+    /// In some cases you really only need a template to be rendered once from
+    /// a string and returned.  The internal name of the template is `<string>`.
+    ///
+    /// This is an alias for [`template_from_str`](Self::template_from_str) paired with
+    /// [`render`](Template::render).
+    ///
+    /// **Note on values:** The [`Value`] type implements `Serialize` and can be
+    /// efficiently passed to render.  It does not undergo actual serialization.
+    pub fn render_str<S: Serialize>(&self, source: &str, ctx: S) -> Result<String, Error> {
+        // reduce total amount of code falling under mono morphization into
+        // this function, and share the rest in _eval.
+        ok!(self.template_from_str(source)).render(ctx)
     }
 
     /// Sets a new function to select the default auto escaping.
@@ -286,6 +393,24 @@ impl<'source> Environment<'source> {
         F: Fn(&str) -> AutoEscape + 'static + Sync + Send,
     {
         self.default_auto_escape = Arc::new(f);
+    }
+
+    /// Changes the undefined behavior.
+    ///
+    /// This changes the runtime behavior of [`undefined`](Value::UNDEFINED) values in
+    /// the template engine.  For more information see [`UndefinedBehavior`].  The
+    /// default is [`UndefinedBehavior::Lenient`].
+    pub fn set_undefined_behavior(&mut self, behavior: UndefinedBehavior) {
+        self.undefined_behavior = behavior;
+    }
+
+    /// Returns the current undefined behavior.
+    ///
+    /// This is particularly useful if a filter function or similar wants to change its
+    /// behavior with regards to undefined values.
+    #[inline(always)]
+    pub fn undefined_behavior(&self) -> UndefinedBehavior {
+        self.undefined_behavior
     }
 
     /// Sets a different formatter function.
@@ -361,6 +486,9 @@ impl<'source> Environment<'source> {
     /// (`None`).  To turn on fuel set something like `Some(50000)` which will
     /// allow 50.000 instructions to execute before running out of fuel.
     ///
+    /// To find out how much fuel is consumed, you can access the fuel levels
+    /// from the [`State`](crate::State).
+    ///
     /// Fuel consumed per-render.
     #[cfg(feature = "fuel")]
     #[cfg_attr(docsrs, doc(cfg(feature = "fuel")))]
@@ -375,42 +503,61 @@ impl<'source> Environment<'source> {
         self.fuel
     }
 
-    /// Sets the template source for the environment.
+    /// Sets the syntax for the environment.
     ///
-    /// This helps when working with dynamically loaded templates.  The
-    /// [`Source`](crate::source::Source) is consulted by the environment to
-    /// look up templates that are requested.  The source has the capabilities
-    /// to load templates with fewer lifetime restrictions and can also
-    /// load templates dynamically at runtime as requested.
+    /// Note that when `source` is used, the syntax is held on the underlying source
+    /// which means that the actual source needs to have it's syntax changed.
     ///
-    /// When a source is set already loaded templates in the environment are
-    /// discarded and replaced with the templates from the source.
-    ///
-    /// For more information see [`Source`](crate::source::Source).
-    #[cfg(feature = "source")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "source")))]
-    pub fn set_source(&mut self, source: crate::source::Source) {
-        self.templates = Source::Owned(source);
+    /// See [`Syntax`](crate::Syntax) for more information.
+    #[cfg(feature = "custom_syntax")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "custom_syntax")))]
+    pub fn set_syntax(&mut self, syntax: crate::custom_syntax::Syntax) -> Result<(), Error> {
+        self.templates.syntax_config = ok!(syntax.compile());
+        Ok(())
     }
 
-    /// Returns the currently set source.
-    #[cfg(feature = "source")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "source")))]
-    pub fn source(&self) -> Option<&crate::source::Source> {
-        match self.templates {
-            Source::Borrowed(_) => None,
-            Source::Owned(ref source) => Some(source),
+    /// Returns the current syntax.
+    #[cfg(feature = "custom_syntax")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "custom_syntax")))]
+    pub fn syntax(&self) -> &crate::custom_syntax::Syntax {
+        &self._syntax_config().syntax
+    }
+
+    fn _syntax_config(&self) -> &SyntaxConfig {
+        &self.templates.syntax_config
+    }
+
+    /// Reconfigures the runtime recursion limit.
+    ///
+    /// This defaults to `500`.  Raising it above that level requires the `stacker`
+    /// feature to be enabled.  Otherwise the limit is silently capped at that safe
+    /// maximum.  Note that the maximum is not necessarily safe if the thread uses
+    /// a lot of stack space already, it's just a value that was validated once to
+    /// provide basic protection.
+    ///
+    /// Every operation that requires recursion in MiniJinja increments an internal
+    /// recursion counter.  The actual cost attributed to that recursion depends on
+    /// the cost of the operation.  If statements and for loops for instance only
+    /// increase the counter by 1, whereas template includes and macros might increase
+    /// it to 10 or more.
+    ///
+    /// **Note on stack growth:** even if the stacker feature is enabled it does not
+    /// mean that in all cases stack can grow to the limits desired.  For instance in
+    /// WASM the maximum limits are additionally enforced by the runtime.
+    pub fn set_recursion_limit(&mut self, level: usize) {
+        #[cfg(not(feature = "stacker"))]
+        {
+            self.recursion_limit = level.min(MAX_RECURSION);
+        }
+        #[cfg(feature = "stacker")]
+        {
+            self.recursion_limit = level;
         }
     }
 
-    /// Returns the currently set source as mutable reference.
-    #[cfg(feature = "source")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "source")))]
-    pub fn source_mut(&mut self) -> Option<&mut crate::source::Source> {
-        match self.templates {
-            Source::Borrowed(_) => None,
-            Source::Owned(ref mut source) => Some(source),
-        }
+    /// Returns the current max recursion limit.
+    pub fn recursion_limit(&self) -> usize {
+        self.recursion_limit
     }
 
     /// Compiles an expression.
@@ -424,7 +571,7 @@ impl<'source> Environment<'source> {
     }
 
     fn _compile_expression(&self, expr: &'source str) -> Result<Expression<'_, 'source>, Error> {
-        let ast = ok!(parse_expr(expr));
+        let ast = ok!(parse_expr(expr, self._syntax_config().clone()));
         let mut gen = CodeGenerator::new("<expression>", expr);
         gen.compile_expr(&ast);
         let (instructions, _) = gen.finish();
@@ -507,6 +654,11 @@ impl<'source> Environment<'source> {
         self.globals.remove(name);
     }
 
+    /// Returns an empty [`State`] for testing purposes and similar.
+    pub fn empty_state(&self) -> State<'_, '_> {
+        State::new_for_env(self)
+    }
+
     /// Looks up a function.
     pub(crate) fn get_global(&self, name: &str) -> Option<Value> {
         self.globals.get(name).cloned()
@@ -522,7 +674,7 @@ impl<'source> Environment<'source> {
         self.tests.get(name)
     }
 
-    pub(crate) fn get_initial_auto_escape(&self, name: &str) -> AutoEscape {
+    pub(crate) fn initial_auto_escape(&self, name: &str) -> AutoEscape {
         (self.default_auto_escape)(name)
     }
 
@@ -537,6 +689,72 @@ impl<'source> Environment<'source> {
         state: &State,
         out: &mut Output,
     ) -> Result<(), Error> {
-        (self.formatter)(out, state, value)
+        if value.is_undefined() && matches!(self.undefined_behavior, UndefinedBehavior::Strict) {
+            Err(Error::from(ErrorKind::UndefinedError))
+        } else {
+            (self.formatter)(out, state, value)
+        }
+    }
+
+    /// Performs a template path join.
+    pub(crate) fn join_template_path<'s>(&self, name: &'s str, parent: &'s str) -> Cow<'s, str> {
+        match self.path_join_callback {
+            Some(ref cb) => cb(name, parent),
+            None => Cow::Borrowed(name),
+        }
     }
 }
+
+#[cfg(not(feature = "loader"))]
+mod basic_store {
+    use super::*;
+
+    #[derive(Clone, Default)]
+    pub struct BasicStore<'source> {
+        pub syntax_config: SyntaxConfig,
+        pub keep_trailing_newline: bool,
+        map: BTreeMap<&'source str, Arc<CompiledTemplate<'source>>>,
+    }
+
+    impl<'source> fmt::Debug for BasicStore<'source> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            BTreeMapKeysDebug(&self.map).fmt(f)
+        }
+    }
+
+    impl<'source> BasicStore<'source> {
+        pub fn insert(&mut self, name: &'source str, source: &'source str) -> Result<(), Error> {
+            self.map.insert(
+                name,
+                Arc::new(ok!(CompiledTemplate::new(
+                    name,
+                    source,
+                    self.syntax_config.clone(),
+                    self.keep_trailing_newline
+                ))),
+            );
+            Ok(())
+        }
+
+        pub fn remove(&mut self, name: &str) {
+            self.map.remove(name);
+        }
+
+        pub fn clear(&mut self) {
+            self.map.clear();
+        }
+
+        pub fn get(&self, name: &str) -> Result<&CompiledTemplate<'source>, Error> {
+            self.map
+                .get(name)
+                .map(|x| &**x)
+                .ok_or_else(|| Error::new_not_found(name))
+        }
+    }
+}
+
+#[cfg(not(feature = "loader"))]
+use self::basic_store::BasicStore as TemplateStore;
+
+#[cfg(feature = "loader")]
+use crate::loader::LoaderStore as TemplateStore;
