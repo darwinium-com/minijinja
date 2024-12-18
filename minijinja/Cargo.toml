@@ -50,7 +50,7 @@ file = []           # to support template source from file
 time_format = ["chrono"]
 
 [dependencies]
-serde = { verison = "1.0.130", optional = true }
+serde = { version = "1.0.130", optional = true }
 v_htmlescape = { version = "0.15.8", optional = true }
 self_cell = { version = "0.10.1", optional = true }
 serde_json = { version = "1.0.68", optional = true }
